@@ -247,23 +247,9 @@ export async function loadBusinessDatabase(
 
   if (cloudEnv && cloudEnv.businesses[businessId]) {
     const cloudState = cloudEnv.businesses[businessId];
-    // Compare activity volume / timestamp to ensure we never overwrite richer local data on first sync
-    const cloudTxCount =
-      (cloudState.sales?.length || 0) +
-      (cloudState.purchases?.length || 0) +
-      (cloudState.financialTransactions?.length || 0) +
-      (cloudState.stockMovements?.length || 0);
-    const localTxCount = localState
-      ? (localState.sales?.length || 0) +
-        (localState.purchases?.length || 0) +
-        (localState.financialTransactions?.length || 0) +
-        (localState.stockMovements?.length || 0)
-      : -1;
-
     if (
       localState &&
-      (localTxCount > cloudTxCount ||
-        localState.settings.updatedAt > cloudState.settings.updatedAt)
+      localState.settings.updatedAt > cloudState.settings.updatedAt
     ) {
       await pushCloudBusinessState(businessId, localState);
       return localState;

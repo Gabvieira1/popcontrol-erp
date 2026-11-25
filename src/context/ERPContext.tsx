@@ -148,6 +148,7 @@ interface ERPContextValue {
     totalAmountCents: number;
     dueDate: string;
   }) => Promise<void>;
+  clearAllInventory: () => Promise<void>;
   importFullDatabaseJson: (jsonState: BusinessDatabaseState) => Promise<void>;
 }
 
@@ -630,6 +631,19 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [runMutation]
   );
 
+  const clearAllInventory = useCallback(async () => {
+    await runMutation((current) => {
+      const next: BusinessDatabaseState = JSON.parse(JSON.stringify(current));
+      const now = new Date().toISOString();
+      next.inventoryLots = [];
+      next.stockMovements = [];
+      next.purchases = [];
+      next.payables = (next.payables || []).filter((p) => !p.isInventoryAcquisition);
+      next.settings.updatedAt = now;
+      return { nextState: next };
+    }, 'Estoque zerado e lotes limpos em todos os dispositivos!');
+  }, [runMutation]);
+
   const importFullDatabaseJson = useCallback(
     async (jsonState: BusinessDatabaseState) => {
       await runMutation(
@@ -682,6 +696,7 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createAccount,
         createManualPayable,
         createManualReceivable,
+        clearAllInventory,
         importFullDatabaseJson,
       }}
     >

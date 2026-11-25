@@ -10,6 +10,7 @@ import {
   ScanBarcode,
   ArrowDownToLine,
   ArrowUpFromLine,
+  Trash2,
 } from 'lucide-react';
 import { useERP } from '../context/ERPContext';
 import {
@@ -23,7 +24,7 @@ import { InventoryLot } from '../types/domain';
 import { BarcodeScannerModal, BarcodeOperationMode } from '../components/BarcodeScannerModal';
 
 export const InventoryModule: React.FC = () => {
-  const { db, adjustStockLot, reconcilePhysicalInventory, notify, setActiveModule } = useERP();
+  const { db, adjustStockLot, reconcilePhysicalInventory, clearAllInventory, notify, setActiveModule } = useERP();
   const [selectedTab, setSelectedTab] = useState<'lots' | 'movements' | 'audit'>('lots');
 
   // Manual Lot Movement Modal
@@ -217,6 +218,20 @@ export const InventoryModule: React.FC = () => {
           >
             + Entrada por Compra
           </button>
+          {db.inventoryLots.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                if (window.confirm('Deseja zerar todo o estoque e remover todos os lotes atuais?')) {
+                  clearAllInventory();
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-red-200 dark:border-red-900 text-[#DC2626] hover:bg-red-50 dark:hover:bg-red-950/30 text-xs font-semibold"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Limpar Estoque
+            </button>
+          )}
         </div>
       </div>
 
