@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   ShoppingCart,
   Zap,
@@ -17,6 +17,8 @@ import {
   Download,
   Eye,
   ScanBarcode,
+  Lock,
+  Clock,
 } from 'lucide-react';
 import { useERP } from '../context/ERPContext';
 import { getProductInventorySummary } from '../lib/accounting';
@@ -38,20 +40,25 @@ interface CartRow {
 }
 
 export const PosModule: React.FC = () => {
-  const { db, createPosSale, notify, isOnline } = useERP();
+  const { db, activeRole, createPosSale, confirmPendingPixSale, notify, isOnline } = useERP();
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState<CartRow[]>([]);
   const [generalDiscountInput, setGeneralDiscountInput] = useState('0,00');
   const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
   const [paymentMethod, setPaymentMethod] = useState<string>('Pix');
   const [accountId, setAccountId] = useState<string>('acc_pix');
+  const [isPixPending, setIsPixPending] = useState<boolean>(false);
+  const [adminApprovalPin, setAdminApprovalPin] = useState<string>('');
   const [notes, setNotes] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Explicit inline feedback banner for errors or confirmation status
+  const [posInlineError, setPosInlineError] = useState<string | null>(null);
 
   // Fast sale payment method selector
   const [fastSaleMethod, setFastSaleMethod] = useState<'Pix' | 'Dinheiro'>('Pix');
 
-  // Idempotency key refreshed only when cart changes or a new sale begins
+  // Idempotency key refreshed ONLY when cart items actually change or after a successful sale
   const [checkoutIdempotencyKey, setCheckoutIdempotencyKey] = useState<string>(
     () => `pos_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   );
@@ -59,6 +66,7 @@ export const PosModule: React.FC = () => {
   // Completed sale receipt modal
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
   const [posScannerOpen, setPosScannerOpen] = useState(false);
+  const cartSectionRef = useRef<HTMLFormElement | null>(null);
 
   if (!db) return null;
   const nowISO = new Date().toISOString();
@@ -86,49 +94,60 @@ export const PosModule: React.FC = () => {
     );
   };
 
-  const addToCart = (product: Product, qty = 1, unitPriceOverride?: number, isFreeReward = false) => {
+  const addToCart = (
+    product: Product,
+    qty = 1,
+    unitPriceOverride?: number,
+    isFreeReward = false,
+    replaceCart = false
+  ): boolean => {
+    setPosInlineError(null);
     const inv = getProductInventorySummary(product.id, db.inventoryLots, nowISO);
-    const existingInCart = cart
-      .filter((r) => r.product.id === product.id)
-      .reduce((acc, r) => acc + r.quantity, 0);
+    const existingInCart = replaceCart
+      ? 0
+      : cart
+          .filter((r) => r.product.id === product.id)
+          .reduce((acc, r) => acc + r.quantity, 0);
 
     if (existingInCart + qty > inv.sellableUnits) {
-      notify(
-        'error',
-        'Estoque vendável insuficiente',
-        `${product.name} possui apenas ${inv.sellableUnits} un disponíveis em lotes válidos.`
-      );
-      return;
+      const msg = `Estoque vendável insuficiente para ${product.name}: disponível ${inv.sellableUnits} un, solicitado ${existingInCart + qty} un.`;
+      setPosInlineError(msg);
+      notify('error', 'Estoque insuficiente no PDV', msg);
+      return false;
     }
 
     setCart((prev) => {
-      const idx = prev.findIndex(
+      const baseList = replaceCart ? [] : prev;
+      const targetPrice = isFreeReward ? 0 : (unitPriceOverride ?? product.salePriceCents);
+      const idx = baseList.findIndex(
         (r) =>
           r.product.id === product.id &&
           r.isLoyaltyFreeReward === isFreeReward &&
-          r.unitPriceCents === (unitPriceOverride ?? product.salePriceCents)
+          r.unitPriceCents === targetPrice
       );
       if (idx !== -1) {
-        const clone = [...prev];
+        const clone = [...baseList];
         clone[idx] = { ...clone[idx], quantity: clone[idx].quantity + qty };
         return clone;
       }
       return [
-        ...prev,
+        ...baseList,
         {
           rowId: `${product.id}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
           product,
           quantity: qty,
-          unitPriceCents: isFreeReward ? 0 : (unitPriceOverride ?? product.salePriceCents),
+          unitPriceCents: targetPrice,
           itemDiscountInput: '0,00',
           isLoyaltyFreeReward: isFreeReward,
         },
       ];
     });
     refreshIdempotency();
+    return true;
   };
 
   const updateRowQty = (rowId: string, delta: number) => {
+    setPosInlineError(null);
     setCart((prev) => {
       const target = prev.find((r) => r.rowId === rowId);
       if (!target) return prev;
@@ -146,11 +165,9 @@ export const PosModule: React.FC = () => {
         .reduce((acc, r) => acc + r.quantity, 0);
 
       if (otherRowsQty + newQty > inv.sellableUnits) {
-        notify(
-          'error',
-          'Limite de estoque atingido',
-          `Disponível para venda: ${inv.sellableUnits} un.`
-        );
+        const msg = `Limite de estoque atingido (${inv.sellableUnits} un disponíveis).`;
+        setPosInlineError(msg);
+        notify('error', 'Limite de estoque atingido', msg);
         return prev;
       }
       return prev.map((r) => (r.rowId === rowId ? { ...r, quantity: newQty } : r));
@@ -158,20 +175,106 @@ export const PosModule: React.FC = () => {
     refreshIdempotency();
   };
 
-  const applyCombo = (comboId: string) => {
+  /**
+   * Item 1 Fix: Promotional Combo ("Combo Duplo Gourmet 2 un — R$ 22,00")
+   * Can either add to cart OR execute a 1-click Combo Sale generating a single sale of R$ 22,00,
+   * leaving 18 units (from 20), CMV R$ 11,78, and Gross Profit R$ 10,22.
+   */
+  const applyComboToCart = (comboId: string) => {
+    setPosInlineError(null);
     const combo = db.combos.find((c) => c.id === comboId);
     if (!combo) return;
     const prod = db.products.find((p) => p.id === combo.productId);
     if (!prod) return;
-    const unitEffectivePrice = Math.round(combo.comboPriceCents / combo.quantity);
-    addToCart(prod, combo.quantity, unitEffectivePrice, false);
-    notify('info', 'Combo aplicado ao carrinho', combo.name);
+
+    // Place the combo at base salePrice (e.g. 2 x R$ 12,00 = R$ 24,00) with exact combo discount (R$ 2,00) so Gross=24,00, Discount=2,00, Final=22,00, CMV=11,78, Profit=10,22
+    const inv = getProductInventorySummary(prod.id, db.inventoryLots, nowISO);
+    if (inv.sellableUnits < combo.quantity) {
+      const msg = `Não foi possível aplicar o ${combo.name}: estoque vendável atual é de ${inv.sellableUnits} un (necessário ${combo.quantity} un).`;
+      setPosInlineError(msg);
+      notify('error', 'Estoque insuficiente para o Combo', msg);
+      return;
+    }
+
+    const regularGrossCents = prod.salePriceCents * combo.quantity;
+    const comboDiscountCents = Math.max(0, regularGrossCents - combo.comboPriceCents);
+
+    setCart([
+      {
+        rowId: `combo_${combo.id}_${Date.now()}`,
+        product: prod,
+        quantity: combo.quantity,
+        unitPriceCents: prod.salePriceCents,
+        itemDiscountInput: formatCentsToDecimal(comboDiscountCents),
+        isLoyaltyFreeReward: false,
+      },
+    ]);
+    setGeneralDiscountInput('0,00');
+    refreshIdempotency();
+    notify(
+      'success',
+      `${combo.name} carregado no carrinho`,
+      `Total: ${formatCentsToBRL(combo.comboPriceCents)} (${combo.quantity} un)`
+    );
+  };
+
+  const handleInstantComboSale = async (comboId: string) => {
+    if (isProcessing) return;
+    setPosInlineError(null);
+    const combo = db.combos.find((c) => c.id === comboId);
+    if (!combo) return;
+    const prod = db.products.find((p) => p.id === combo.productId);
+    if (!prod) return;
+
+    const inv = getProductInventorySummary(prod.id, db.inventoryLots, nowISO);
+    if (inv.sellableUnits < combo.quantity) {
+      const msg = `Falha ao vender ${combo.name}: estoque vendável insuficiente (${inv.sellableUnits} un disponíveis, necessário ${combo.quantity} un).`;
+      setPosInlineError(msg);
+      notify('error', 'Operação bloqueada: Estoque insuficiente', msg);
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const regularGrossCents = prod.salePriceCents * combo.quantity;
+      const comboDiscountCents = Math.max(0, regularGrossCents - combo.comboPriceCents);
+      const targetAccount = fastSaleMethod === 'Dinheiro' ? 'acc_cash' : 'acc_pix';
+
+      const sale = await createPosSale({
+        idempotencyKey: checkoutIdempotencyKey,
+        items: [
+          {
+            productId: prod.id,
+            quantity: combo.quantity,
+            unitPriceCents: prod.salePriceCents,
+            itemDiscountCents: comboDiscountCents,
+          },
+        ],
+        generalDiscountCents: 0,
+        customerId: selectedCustomerId || undefined,
+        paymentMethod: fastSaleMethod,
+        accountId: targetAccount,
+        paymentReceivedImmediately: !isPixPending,
+        isPixPending: fastSaleMethod === 'Pix' && isPixPending,
+        notes: `${combo.name} — Venda única confirmada`,
+      });
+      setCart([]);
+      refreshIdempotency();
+      setCompletedSale(sale);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Erro desconhecido ao processar combo.';
+      setPosInlineError(msg);
+      notify('error', 'Não foi possível concluir a venda do Combo', msg);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const cartTotals = useMemo(() => {
     let subtotalCents = 0;
     let itemDiscountsCents = 0;
     let totalUnits = 0;
+    let estimatedCmvCents = 0;
 
     for (const row of cart) {
       totalUnits += row.quantity;
@@ -180,6 +283,7 @@ export const PosModule: React.FC = () => {
         const disc = Math.min(gross, parseReaisToCents(row.itemDiscountInput));
         subtotalCents += gross;
         itemDiscountsCents += disc;
+        estimatedCmvCents += row.quantity * row.product.acquisitionCostCents;
       }
     }
 
@@ -189,6 +293,9 @@ export const PosModule: React.FC = () => {
     );
     const totalDiscountCents = itemDiscountsCents + generalDisc;
     const finalTotalCents = Math.max(0, subtotalCents - totalDiscountCents);
+    const estimatedGrossProfitCents = finalTotalCents - estimatedCmvCents;
+    const discountPercent =
+      subtotalCents > 0 ? (totalDiscountCents / subtotalCents) * 100 : 0;
 
     return {
       totalUnits,
@@ -197,23 +304,30 @@ export const PosModule: React.FC = () => {
       generalDisc,
       totalDiscountCents,
       finalTotalCents,
+      estimatedCmvCents,
+      estimatedGrossProfitCents,
+      discountPercent,
     };
   }, [cart, generalDiscountInput]);
+
+  const maxOperatorDiscountPct =
+    db.settings.permissionsConfig?.operatorMaxDiscountPercent ?? 10;
+  const requiresSupervisorPin =
+    activeRole === 'operator' && cartTotals.discountPercent > maxOperatorDiscountPct;
 
   // Fast 1-Click Sale (Section 6: "Vender 1 unidade — R$ 12,00")
   const handleFastSale = async () => {
     if (!featuredProduct || isProcessing) return;
+    setPosInlineError(null);
     const inv = getProductInventorySummary(
       featuredProduct.id,
       db.inventoryLots,
       nowISO
     );
     if (inv.sellableUnits < 1) {
-      notify(
-        'error',
-        'Sem estoque vendável',
-        `Não há unidades disponíveis de ${featuredProduct.name}. Registre o recebimento de uma compra primeiro.`
-      );
+      const msg = `Operação recusada: ${featuredProduct.name} está com estoque vendável zerado (0 un). Registre o recebimento de um lote antes de vender.`;
+      setPosInlineError(msg);
+      notify('error', 'Sem estoque vendável', msg);
       return;
     }
 
@@ -222,7 +336,7 @@ export const PosModule: React.FC = () => {
       const targetAccount =
         fastSaleMethod === 'Dinheiro' ? 'acc_cash' : 'acc_pix';
       const sale = await createPosSale({
-        idempotencyKey: `fast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        idempotencyKey: checkoutIdempotencyKey,
         items: [
           {
             productId: featuredProduct.id,
@@ -235,27 +349,30 @@ export const PosModule: React.FC = () => {
         customerId: selectedCustomerId || undefined,
         paymentMethod: fastSaleMethod,
         accountId: targetAccount,
-        paymentReceivedImmediately: true,
+        paymentReceivedImmediately: !(fastSaleMethod === 'Pix' && isPixPending),
+        isPixPending: fastSaleMethod === 'Pix' && isPixPending,
         notes: 'Venda Rápida 1 clique (Confirmação manual de pagamento)',
       });
+      refreshIdempotency();
       setCompletedSale(sale);
     } catch (err) {
-      notify(
-        'error',
-        'Erro ao finalizar venda rápida',
-        err instanceof Error ? err.message : ''
-      );
+      const msg = err instanceof Error ? err.message : 'Falha na venda rápida.';
+      setPosInlineError(msg);
+      notify('error', 'Erro ao finalizar venda rápida', msg);
     } finally {
       setIsProcessing(false);
     }
   };
 
   // Standard Cart Checkout
-  const handleCheckoutCart = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleCheckoutCart = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (cart.length === 0 || isProcessing) return;
+    setPosInlineError(null);
     setIsProcessing(true);
     try {
+      const isCard =
+        paymentMethod === 'Cartão de débito' || paymentMethod === 'Cartão de crédito';
       const sale = await createPosSale({
         idempotencyKey: checkoutIdempotencyKey,
         items: cart.map((r) => ({
@@ -269,21 +386,30 @@ export const PosModule: React.FC = () => {
         customerId: selectedCustomerId || undefined,
         paymentMethod,
         accountId,
-        paymentReceivedImmediately: true,
+        paymentReceivedImmediately: !(
+          (paymentMethod === 'Pix' && isPixPending) ||
+          isCard
+        ),
+        isPixPending: paymentMethod === 'Pix' && isPixPending,
+        isCardToSettle: isCard,
+        adminApprovalPin: adminApprovalPin || undefined,
+        actingRole: activeRole,
         notes: notes.trim() || undefined,
       });
 
       setCart([]);
       setGeneralDiscountInput('0,00');
+      setAdminApprovalPin('');
       setNotes('');
       refreshIdempotency();
       setCompletedSale(sale);
     } catch (err) {
-      notify(
-        'error',
-        'Venda não realizada',
-        err instanceof Error ? err.message : ''
-      );
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível concluir a venda. Verifique estoque e conexão.';
+      setPosInlineError(msg);
+      notify('error', 'Venda não realizada', msg);
     } finally {
       setIsProcessing(false);
     }
@@ -311,30 +437,58 @@ export const PosModule: React.FC = () => {
           }`
       ),
       `--------------------------------`,
-      `Subtotal: ${formatCentsToBRL(sale.subtotalCents)}`,
+      `Subtotal Bruto: ${formatCentsToBRL(sale.subtotalCents)}`,
       sale.totalDiscountCents > 0
         ? `Descontos: -${formatCentsToBRL(sale.totalDiscountCents)}`
         : null,
-      `TOTAL PAGO: ${formatCentsToBRL(sale.totalCents)}`,
-      `Forma de Pagamento: ${sale.paymentMethod} (Confirmado manualmente)`,
+      `VALOR FINAL: ${formatCentsToBRL(sale.totalCents)}`,
+      `CMV Apurado (FEFO): ${formatCentsToBRL(sale.totalCmvCents)}`,
+      `Lucro Bruto (antes taxas/desp.): ${formatCentsToBRL(sale.grossProfitCents)}`,
+      `Pagamento: ${sale.paymentMethod} (${
+        sale.paymentStatus === 'pending_pix'
+          ? 'PIX PENDENTE DE CONFIRMAÇÃO'
+          : sale.paymentStatus === 'pending_card_settlement'
+          ? 'CARTÃO A LIQUIDAR'
+          : 'RECEBIDO NO CAIXA'
+      })`,
       `Obrigado pela preferência!`,
     ].filter(Boolean);
     return lines.join('\n');
   };
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 pb-24 lg:pb-6 max-w-full overflow-x-hidden">
+      {/* Clear Error Explanation Banner whenever an operation fails */}
+      {posInlineError && (
+        <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/60 border-2 border-[#DC2626] text-[#DC2626] dark:text-red-200 flex items-start justify-between gap-3 shadow-md">
+          <div className="flex items-start gap-2.5 text-xs">
+            <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+            <div>
+              <strong className="block text-sm">Operação não concluída no PDV</strong>
+              <span>{posInlineError}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPosInlineError(null)}
+            className="text-xs font-bold underline shrink-0"
+          >
+            Fechar aviso
+          </button>
+        </div>
+      )}
+
       {/* Fast Sale Banner (Section 6: "Vender 1 unidade — R$ 12,00") */}
       {featuredProduct && (
         <div className="bg-[#18181B] dark:bg-zinc-900 border border-zinc-800 text-white rounded-xl p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-sm">
-          <div className="flex items-start sm:items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-[#F6C344] text-[#18181B] flex items-center justify-center shrink-0">
-              <Zap className="w-6 h-6 fill-current" />
+          <div className="flex items-start sm:items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-xl bg-[#F6C344] text-[#18181B] flex items-center justify-center shrink-0">
+              <Zap className="w-5 h-5 fill-current" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-[#F6C344]/20 text-[#F6C344]">
-                  Venda Expressa 1 Toque
+                  Venda Expressa
                 </span>
                 <span className="text-xs text-zinc-400 font-mono">
                   Estoque:{' '}
@@ -348,20 +502,20 @@ export const PosModule: React.FC = () => {
                   un
                 </span>
               </div>
-              <h3 className="text-sm sm:text-base font-bold mt-1">
+              <h3 className="text-sm sm:text-base font-bold mt-1 truncate">
                 {featuredProduct.name} ({featuredProduct.sku})
               </h3>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex rounded-lg bg-zinc-800 p-1 text-xs">
               {(['Pix', 'Dinheiro'] as const).map((m) => (
                 <button
                   key={m}
                   type="button"
                   onClick={() => setFastSaleMethod(m)}
-                  className={`px-3 py-1.5 rounded-md font-semibold transition ${
+                  className={`px-2.5 py-1.5 rounded-md font-semibold transition ${
                     fastSaleMethod === m
                       ? 'bg-[#F6C344] text-[#18181B]'
                       : 'text-zinc-300 hover:text-white'
@@ -376,7 +530,7 @@ export const PosModule: React.FC = () => {
               type="button"
               disabled={isProcessing || !isOnline}
               onClick={handleFastSale}
-              className="flex-1 sm:flex-initial px-5 py-2.5 rounded-xl bg-[#F6C344] hover:bg-[#F6C344]/90 text-[#18181B] font-bold text-sm shadow-md transition disabled:opacity-50"
+              className="flex-1 sm:flex-initial px-4 py-2.5 rounded-xl bg-[#F6C344] hover:bg-[#F6C344]/90 text-[#18181B] font-bold text-xs sm:text-sm shadow-md transition disabled:opacity-50"
             >
               Vender 1 unidade — {formatCentsToBRL(featuredProduct.salePriceCents)}
             </button>
@@ -385,12 +539,12 @@ export const PosModule: React.FC = () => {
       )}
 
       {/* Main POS Grid: Products on Left, Cart on Right */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
         {/* Product Selection Column */}
-        <div className="lg:col-span-7 space-y-4">
-          <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-4 space-y-3">
+        <div className="lg:col-span-7 space-y-4 min-w-0">
+          <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-3.5 sm:p-4 space-y-3">
             <div className="flex gap-2">
-              <div className="relative flex-1">
+              <div className="relative flex-1 min-w-0">
                 <Search className="w-4 h-4 text-[#71717A] absolute left-3 top-2.5" />
                 <input
                   type="text"
@@ -411,39 +565,64 @@ export const PosModule: React.FC = () => {
                       }
                     }
                   }}
-                  placeholder="Buscar ou bipar código de barras / SKU (DP001)..."
+                  placeholder="Buscar ou bipar código / SKU (DP001)..."
                   className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-[#F7F8FA] dark:bg-zinc-800"
                 />
               </div>
               <button
                 type="button"
                 onClick={() => setPosScannerOpen(true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] text-xs font-bold shrink-0"
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] text-xs font-bold shrink-0"
               >
                 <ScanBarcode className="w-4 h-4" />
-                <span>Bipar Câmera</span>
+                <span className="hidden sm:inline">Bipar Câmera</span>
+                <span className="sm:hidden">Bipar</span>
               </button>
             </div>
 
-            {/* Promotional Combos Bar */}
+            {/* Promotional Combos Bar (Item 1: Combo 2 un = R$ 22,00, CMV R$ 11,78, Lucro Bruto R$ 10,22) */}
             {db.combos.filter((c) => c.active).length > 0 && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
-                <span className="text-[11px] font-semibold text-[#71717A] flex items-center gap-1">
-                  <Tag className="w-3.5 h-3.5 text-[#A16207]" />
-                  Combos:
-                </span>
-                {db.combos
-                  .filter((c) => c.active)
-                  .map((combo) => (
-                    <button
-                      key={combo.id}
-                      type="button"
-                      onClick={() => applyCombo(combo.id)}
-                      className="px-2.5 py-1 rounded-lg bg-[#F6C344]/15 border border-[#F6C344]/50 text-xs font-semibold text-[#A16207] dark:text-[#F6C344] hover:bg-[#F6C344]/25"
-                    >
-                      + {combo.name} ({formatCentsToBRL(combo.comboPriceCents)})
-                    </button>
-                  ))}
+              <div className="p-3 rounded-xl bg-[#F6C344]/15 border border-[#F6C344]/50 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-[#A16207] dark:text-[#F6C344] flex items-center gap-1.5">
+                    <Tag className="w-3.5 h-3.5" />
+                    Combos Promocionais (Venda Única c/ Desconto):
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {db.combos
+                    .filter((c) => c.active)
+                    .map((combo) => (
+                      <div
+                        key={combo.id}
+                        className="flex flex-wrap items-center gap-1.5 bg-white dark:bg-zinc-900 p-1.5 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 w-full sm:w-auto justify-between"
+                      >
+                        <div className="px-1.5">
+                          <span className="text-xs font-bold block">{combo.name}</span>
+                          <span className="text-[11px] font-mono text-[#16A34A] font-semibold">
+                            {formatCentsToBRL(combo.comboPriceCents)} ({combo.quantity} un)
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => applyComboToCart(combo.id)}
+                            className="px-2.5 py-1.5 rounded-md border border-[#E4E4E7] dark:border-zinc-700 text-[11px] font-semibold hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          >
+                            No Carrinho
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isProcessing}
+                            onClick={() => handleInstantComboSale(combo.id)}
+                            className="px-3 py-1.5 rounded-md bg-[#16A34A] hover:bg-emerald-700 text-white text-[11px] font-bold"
+                          >
+                            Vender Combo ({formatCentsToBRL(combo.comboPriceCents)})
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                </div>
               </div>
             )}
           </div>
@@ -490,12 +669,12 @@ export const PosModule: React.FC = () => {
                     </p>
                   </div>
 
-                  <div className="mt-3 pt-3 border-t border-[#E4E4E7] dark:border-zinc-800 flex items-center gap-2">
+                  <div className="mt-3 pt-3 border-t border-[#E4E4E7] dark:border-zinc-800 flex items-center gap-1.5">
                     <button
                       type="button"
                       disabled={outOfStock}
                       onClick={() => addToCart(product, 1)}
-                      className="flex-1 py-2 px-3 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5"
+                      className="flex-1 py-2 px-2.5 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1"
                     >
                       <Plus className="w-3.5 h-3.5" />
                       Adicionar 1 un
@@ -524,10 +703,11 @@ export const PosModule: React.FC = () => {
         </div>
 
         {/* Cart & Checkout Column */}
-        <div className="lg:col-span-5">
+        <div className="lg:col-span-5 min-w-0">
           <form
+            ref={cartSectionRef}
             onSubmit={handleCheckoutCart}
-            className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-5 space-y-4 sticky top-20"
+            className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-4 sm:p-5 space-y-4 lg:sticky lg:top-20"
           >
             <div className="flex items-center justify-between pb-3 border-b border-[#E4E4E7] dark:border-zinc-800">
               <div className="flex items-center gap-2">
@@ -541,6 +721,7 @@ export const PosModule: React.FC = () => {
                   type="button"
                   onClick={() => {
                     setCart([]);
+                    setPosInlineError(null);
                     refreshIdempotency();
                   }}
                   className="text-xs text-[#DC2626] hover:underline"
@@ -553,7 +734,7 @@ export const PosModule: React.FC = () => {
             {/* Cart Items List */}
             {cart.length === 0 ? (
               <div className="py-8 text-center text-xs text-[#71717A] border border-dashed border-[#E4E4E7] dark:border-zinc-800 rounded-lg">
-                Selecione um produto ao lado ou use o botão de Venda Rápida no topo.
+                Selecione um produto, aplique um Combo ou use a Venda Rápida.
               </div>
             ) : (
               <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
@@ -563,8 +744,8 @@ export const PosModule: React.FC = () => {
                     className="p-3 rounded-lg bg-[#F7F8FA] dark:bg-zinc-800/70 border border-[#E4E4E7] dark:border-zinc-800 text-xs space-y-2"
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <span className="font-semibold block">
+                      <div className="min-w-0">
+                        <span className="font-semibold block truncate">
                           {row.product.name}
                           {row.isLoyaltyFreeReward && (
                             <span className="ml-1.5 px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950 text-[#16A34A] text-[10px] font-bold">
@@ -578,16 +759,17 @@ export const PosModule: React.FC = () => {
                       </div>
                       <button
                         type="button"
-                        onClick={() =>
-                          setCart((prev) => prev.filter((r) => r.rowId !== row.rowId))
-                        }
-                        className="text-[#71717A] hover:text-[#DC2626]"
+                        onClick={() => {
+                          setCart((prev) => prev.filter((r) => r.rowId !== row.rowId));
+                          refreshIdempotency();
+                        }}
+                        className="text-[#71717A] hover:text-[#DC2626] shrink-0"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
 
-                    <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="inline-flex items-center gap-1 bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-700 rounded-lg px-1.5 py-0.5">
                         <button
                           type="button"
@@ -642,11 +824,11 @@ export const PosModule: React.FC = () => {
               </div>
             )}
 
-            {/* Customer & Loyalty Optional Selection */}
+            {/* Customer, Payment & Pix Pending Control (Item 2) */}
             <div className="space-y-3 pt-2 border-t border-[#E4E4E7] dark:border-zinc-800 text-xs">
               <div>
                 <label className="block font-medium mb-1">
-                  Cliente (Opcional — Programa de Fidelidade)
+                  Cliente (Opcional — Fidelidade)
                 </label>
                 <select
                   value={selectedCustomerId}
@@ -657,7 +839,7 @@ export const PosModule: React.FC = () => {
                   {db.customers.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name} ({c.loyaltyPointsPaidUnits}/
-                      {db.settings.loyaltyRules.paidUnitsRequired} selos fidelidade)
+                      {db.settings.loyaltyRules.paidUnitsRequired} selos)
                     </option>
                   ))}
                 </select>
@@ -670,7 +852,7 @@ export const PosModule: React.FC = () => {
                   className="w-full py-2 px-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-300 dark:border-emerald-800 text-[#16A34A] font-semibold flex items-center justify-center gap-1.5"
                 >
                   <Gift className="w-4 h-4" />
-                  Resgatar 1 Unidade Gratuita de Fidelidade ({selectedCustomer.name})
+                  Resgatar 1 Unidade Gratuita de Fidelidade
                 </button>
               )}
 
@@ -706,45 +888,88 @@ export const PosModule: React.FC = () => {
                 </div>
               </div>
 
-              <div>
-                <label className="block font-medium mb-1">Observações (Opcional)</label>
-                <input
-                  type="text"
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder="Ex.: Cliente pediu sacola para presente"
-                  className="w-full px-3 py-1.5 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
-                />
-              </div>
+              {/* Pix Pending Option (Item 2) */}
+              {paymentMethod === 'Pix' && (
+                <label className="flex items-center gap-2 p-2.5 rounded-lg bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={isPixPending}
+                    onChange={(e) => setIsPixPending(e.target.checked)}
+                    className="w-4 h-4 rounded"
+                  />
+                  <div>
+                    <span className="font-semibold block text-[#A16207] dark:text-[#F6C344]">
+                      Registrar como Pix Pendente de Confirmação
+                    </span>
+                    <span className="text-[11px] text-[#71717A]">
+                      Baixa o estoque agora, mas aguarda conferência do comprovante para entrar no saldo em caixa.
+                    </span>
+                  </div>
+                </label>
+              )}
+
+              {/* Card to Settle notice */}
+              {(paymentMethod === 'Cartão de débito' ||
+                paymentMethod === 'Cartão de crédito') && (
+                <div className="p-2.5 rounded-lg bg-blue-50/70 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900 text-[11px] text-blue-700 dark:text-blue-300">
+                  <strong>Cartão a Liquidar:</strong> A venda gera título em Contas a Receber descontando a taxa da maquininha (
+                  {paymentMethod === 'Cartão de débito'
+                    ? `${db.settings.permissionsConfig?.debitCardFeePercent ?? 1.99}%`
+                    : `${db.settings.permissionsConfig?.creditCardFeePercent ?? 3.99}%`}
+                  ) e entra no caixa na liquidação.
+                </div>
+              )}
+
+              {/* Supervisor PIN Approval when Operator exceeds discount threshold (Item 2) */}
+              {requiresSupervisorPin && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 space-y-2">
+                  <div className="flex items-center gap-1.5 text-[#DC2626] font-bold">
+                    <Lock className="w-4 h-4" />
+                    <span>
+                      Desconto ({cartTotals.discountPercent.toFixed(1)}%) acima do limite de Operador ({maxOperatorDiscountPct}%)
+                    </span>
+                  </div>
+                  <input
+                    type="password"
+                    required
+                    value={adminApprovalPin}
+                    onChange={(e) => setAdminApprovalPin(e.target.value)}
+                    placeholder="Digite o PIN do Administrador (Padrão: 1234)"
+                    className="w-full px-3 py-1.5 rounded border border-red-300 dark:border-red-700 bg-white dark:bg-zinc-900 font-mono"
+                  />
+                </div>
+              )}
             </div>
 
-            {/* Totals Breakdown */}
+            {/* Totals Breakdown with Pre-Confirmation CMV & Gross Profit */}
             <div className="p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800/80 border border-[#E4E4E7] dark:border-zinc-700 space-y-1.5 text-xs">
               <div className="flex justify-between text-[#71717A]">
-                <span>Subtotal Bruto:</span>
+                <span>Subtotal Bruto ({cartTotals.totalUnits} un):</span>
                 <span className="font-mono">{formatCentsToBRL(cartTotals.subtotalCents)}</span>
               </div>
               {cartTotals.totalDiscountCents > 0 && (
                 <div className="flex justify-between text-[#DC2626]">
-                  <span>Total de Descontos:</span>
+                  <span>Descontos ({cartTotals.discountPercent.toFixed(1)}%):</span>
                   <span className="font-mono">
                     -{formatCentsToBRL(cartTotals.totalDiscountCents)}
                   </span>
                 </div>
               )}
+              <div className="flex justify-between text-[#71717A]">
+                <span>CMV Estimado / Lucro Bruto:</span>
+                <span className="font-mono">
+                  {formatCentsToBRL(cartTotals.estimatedCmvCents)} /{' '}
+                  <strong className="text-[#16A34A]">
+                    {formatCentsToBRL(cartTotals.estimatedGrossProfitCents)}
+                  </strong>
+                </span>
+              </div>
               <div className="flex justify-between text-sm font-bold pt-1 border-t border-[#E4E4E7] dark:border-zinc-700">
-                <span>Total da Venda:</span>
+                <span>Total a Pagar:</span>
                 <span className="font-mono text-base text-[#16A34A]">
                   {formatCentsToBRL(cartTotals.finalTotalCents)}
                 </span>
               </div>
-            </div>
-
-            <div className="p-2.5 rounded-lg bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200/70 dark:border-amber-900/50 flex items-center gap-2 text-[11px] text-[#A16207] dark:text-[#F6C344]">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>
-                Confirmação manual: certifique-se de que o pagamento ({paymentMethod}) foi recebido antes de confirmar.
-              </span>
             </div>
 
             <button
@@ -754,21 +979,52 @@ export const PosModule: React.FC = () => {
             >
               <CheckCircle2 className="w-4 h-4" />
               {isProcessing
-                ? 'Processando Transação Atômica...'
+                ? 'Processando Venda...'
                 : `Confirmar Venda (${formatCentsToBRL(cartTotals.finalTotalCents)})`}
             </button>
           </form>
         </div>
       </div>
 
-      {/* Non-Fiscal Commercial Receipt Modal (Section 6) */}
+      {/* Item 3: Mobile Sticky Checkout Bar (Always keeps Total & Confirm button accessible during mobile service) */}
+      {cart.length > 0 && (
+        <div className="lg:hidden fixed bottom-16 inset-x-0 z-30 bg-[#18181B] text-white border-t border-zinc-800 px-4 py-2.5 flex items-center justify-between gap-3 shadow-2xl">
+          <div
+            onClick={() =>
+              cartSectionRef.current?.scrollIntoView({ behavior: 'smooth' })
+            }
+            className="cursor-pointer min-w-0"
+          >
+            <span className="text-[10px] uppercase tracking-wider text-zinc-400 block">
+              {cartTotals.totalUnits} un • {paymentMethod}{' '}
+              {paymentMethod === 'Pix' && isPixPending ? '(Pendente)' : ''}
+            </span>
+            <strong className="font-mono text-base text-[#F6C344]">
+              Total: {formatCentsToBRL(cartTotals.finalTotalCents)}
+            </strong>
+          </div>
+          <button
+            type="button"
+            disabled={isProcessing || !isOnline}
+            onClick={() => handleCheckoutCart()}
+            className="px-4 py-2.5 rounded-xl bg-[#16A34A] text-white font-bold text-xs shrink-0 flex items-center gap-1.5 shadow-md"
+          >
+            <CheckCircle2 className="w-4 h-4" />
+            Confirmar Venda
+          </button>
+        </div>
+      )}
+
+      {/* Non-Fiscal Commercial Receipt Modal with Clear Financial Summary (Item 1) */}
       {completedSale && (
-        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl max-w-md w-full p-6 shadow-2xl space-y-4">
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl max-w-md w-full p-5 sm:p-6 shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-[#16A34A]">
                 <CheckCircle2 className="w-5 h-5" />
-                <h3 className="text-base font-bold">Venda {completedSale.code} Concluída!</h3>
+                <h3 className="text-base font-bold">
+                  Venda {completedSale.code} Confirmada!
+                </h3>
               </div>
               <button
                 type="button"
@@ -779,7 +1035,58 @@ export const PosModule: React.FC = () => {
               </button>
             </div>
 
-            <pre className="p-4 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800 border border-[#E4E4E7] dark:border-zinc-700 font-mono text-xs whitespace-pre-wrap leading-relaxed">
+            {/* Clear Financial & Inventory Summary Box (Item 1 requirement) */}
+            <div className="grid grid-cols-2 gap-2 p-3 rounded-xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 text-xs">
+              <div>
+                <span className="text-[#71717A] block">Valor Final da Venda</span>
+                <strong className="font-mono text-sm text-[#18181B] dark:text-white">
+                  {formatCentsToBRL(completedSale.totalCents)}
+                </strong>
+              </div>
+              <div>
+                <span className="text-[#71717A] block">Unidades Vendidas</span>
+                <strong className="font-mono text-sm">
+                  {completedSale.totalUnits} un
+                </strong>
+              </div>
+              <div>
+                <span className="text-[#71717A] block">CMV Apurado (FEFO)</span>
+                <strong className="font-mono text-sm">
+                  {formatCentsToBRL(completedSale.totalCmvCents)}
+                </strong>
+              </div>
+              <div>
+                <span className="text-[#71717A] block">Lucro Bruto da Venda</span>
+                <strong className="font-mono text-sm text-[#16A34A]">
+                  {formatCentsToBRL(completedSale.grossProfitCents)}
+                </strong>
+              </div>
+            </div>
+
+            {completedSale.paymentStatus === 'pending_pix' && (
+              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 text-[#A16207] dark:text-[#F6C344]">
+                  <Clock className="w-4 h-4 shrink-0" />
+                  <span>Pix registrado como Pendente de Confirmação.</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await confirmPendingPixSale(completedSale.id);
+                    setCompletedSale({
+                      ...completedSale,
+                      paymentStatus: 'received',
+                      paymentReceivedImmediately: true,
+                    });
+                  }}
+                  className="px-2.5 py-1 rounded bg-[#16A34A] text-white font-bold shrink-0"
+                >
+                  Confirmar Pix Agora
+                </button>
+              </div>
+            )}
+
+            <pre className="p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800 border border-[#E4E4E7] dark:border-zinc-700 font-mono text-[11px] whitespace-pre-wrap leading-relaxed">
               {formatReceiptText(completedSale)}
             </pre>
 
@@ -788,9 +1095,9 @@ export const PosModule: React.FC = () => {
                 type="button"
                 onClick={() => {
                   navigator.clipboard.writeText(formatReceiptText(completedSale));
-                  notify('success', 'Comprovante copiado para a área de transferência!');
+                  notify('success', 'Comprovante copiado!');
                 }}
-                className="py-2 px-3 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 font-medium flex items-center justify-center gap-1.5 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                className="py-2 px-3 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 font-medium flex items-center justify-center gap-1.5"
               >
                 <Copy className="w-3.5 h-3.5" />
                 Copiar
@@ -798,7 +1105,7 @@ export const PosModule: React.FC = () => {
               <button
                 type="button"
                 onClick={() => window.print()}
-                className="py-2 px-3 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 font-medium flex items-center justify-center gap-1.5 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                className="py-2 px-3 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 font-medium flex items-center justify-center gap-1.5"
               >
                 <Printer className="w-3.5 h-3.5" />
                 Imprimir
@@ -821,7 +1128,7 @@ export const PosModule: React.FC = () => {
               onClick={() => setCompletedSale(null)}
               className="w-full py-2.5 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] text-xs font-bold"
             >
-              Registrar Nova Venda
+              Iniciar Novo Atendimento
             </button>
           </div>
         </div>
@@ -845,10 +1152,10 @@ export const PosModule: React.FC = () => {
 };
 
 /**
- * SALES MANAGEMENT & REFUND MODULE (Section 7)
+ * SALES MANAGEMENT & REFUND MODULE (Section 7 + Item 2 Pix Pendente & Admin Approval)
  */
 export const SalesModule: React.FC = () => {
-  const { db, refundOrCancelSale, notify } = useERP();
+  const { db, activeRole, refundOrCancelSale, confirmPendingPixSale, notify } = useERP();
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'completed' | 'refunded' | 'cancelled'>('all');
   const [page, setPage] = useState(1);
@@ -858,6 +1165,7 @@ export const SalesModule: React.FC = () => {
   const [refundMode, setRefundMode] = useState<'refunded' | 'cancelled'>('refunded');
   const [returnToStock, setReturnToStock] = useState(true);
   const [refundReason, setRefundReason] = useState('');
+  const [refundAdminPin, setRefundAdminPin] = useState('');
   const [inspectSale, setInspectSale] = useState<Sale | null>(null);
 
   if (!db) return null;
@@ -890,6 +1198,7 @@ export const SalesModule: React.FC = () => {
       'CMV_Historico_BRL',
       'Lucro_Bruto_BRL',
       'Forma_Pagamento',
+      'Status_Recebimento',
       'Status',
     ];
     const rows = filteredSales.map((s) => [
@@ -904,6 +1213,7 @@ export const SalesModule: React.FC = () => {
       formatCentsToDecimal(s.totalCmvCents),
       formatCentsToDecimal(s.grossProfitCents),
       s.paymentMethod,
+      s.paymentStatus || (s.paymentReceivedImmediately ? 'received' : 'pending'),
       s.status,
     ]);
 
@@ -928,9 +1238,12 @@ export const SalesModule: React.FC = () => {
         mode: refundMode,
         returnToSellableStock: returnToStock,
         reason: refundReason,
+        adminApprovalPin: refundAdminPin || undefined,
+        actingRole: activeRole,
       });
       setSelectedSaleForRefund(null);
       setRefundReason('');
+      setRefundAdminPin('');
     } catch (err) {
       notify(
         'error',
@@ -1005,7 +1318,6 @@ export const SalesModule: React.FC = () => {
                 <tr className="border-b border-[#E4E4E7] dark:border-zinc-800 bg-[#F7F8FA] dark:bg-zinc-800/50 text-[#71717A]">
                   <th className="py-2.5 px-3">ID</th>
                   <th className="py-2.5 px-3">Data / Hora</th>
-                  <th className="py-2.5 px-3">Cliente</th>
                   <th className="py-2.5 px-3">Produtos</th>
                   <th className="py-2.5 px-3">Qtd</th>
                   <th className="py-2.5 px-3">Bruto</th>
@@ -1013,7 +1325,7 @@ export const SalesModule: React.FC = () => {
                   <th className="py-2.5 px-3">Valor Final</th>
                   <th className="py-2.5 px-3">CMV Hist.</th>
                   <th className="py-2.5 px-3">Lucro Bruto</th>
-                  <th className="py-2.5 px-3">Pagto</th>
+                  <th className="py-2.5 px-3">Recebimento</th>
                   <th className="py-2.5 px-3">Status</th>
                   <th className="py-2.5 px-3 text-right">Ações</th>
                 </tr>
@@ -1025,7 +1337,6 @@ export const SalesModule: React.FC = () => {
                     <td className="py-3 px-3 font-mono text-[11px]">
                       {new Date(sale.createdAt).toLocaleString('pt-BR')}
                     </td>
-                    <td className="py-3 px-3">{sale.customerName || '—'}</td>
                     <td className="py-3 px-3 max-w-xs truncate">
                       {sale.items.map((i) => `${i.quantity}x ${i.productName}`).join(', ')}
                     </td>
@@ -1047,7 +1358,25 @@ export const SalesModule: React.FC = () => {
                     <td className="py-3 px-3 font-mono font-semibold text-[#16A34A]">
                       {formatCentsToBRL(sale.grossProfitCents)}
                     </td>
-                    <td className="py-3 px-3">{sale.paymentMethod}</td>
+                    <td className="py-3 px-3">
+                      <span className="block font-medium">{sale.paymentMethod}</span>
+                      {sale.paymentStatus === 'pending_pix' && sale.status === 'completed' ? (
+                        <button
+                          type="button"
+                          onClick={() => confirmPendingPixSale(sale.id)}
+                          className="mt-1 px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950 text-[#A16207] dark:text-[#F6C344] text-[10px] font-bold hover:underline"
+                        >
+                          Pix Pendente → Confirmar
+                        </button>
+                      ) : sale.paymentStatus === 'pending_card_settlement' &&
+                        sale.status === 'completed' ? (
+                        <span className="text-[10px] text-blue-600 dark:text-blue-400 font-semibold">
+                          A Liquidar (Líq: {formatCentsToBRL(sale.netSettlementCents ?? sale.totalCents)})
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-[#16A34A]">Recebido</span>
+                      )}
+                    </td>
                     <td className="py-3 px-3">
                       <span
                         className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
@@ -1122,7 +1451,7 @@ export const SalesModule: React.FC = () => {
         )}
       </div>
 
-      {/* Refund / Cancel Confirmation Modal */}
+      {/* Refund / Cancel Confirmation Modal with Operator PIN gate */}
       {selectedSaleForRefund && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl max-w-md w-full p-6 shadow-xl">
@@ -1176,6 +1505,22 @@ export const SalesModule: React.FC = () => {
                   className="w-full px-3 py-2 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
                 />
               </div>
+
+              {activeRole === 'operator' && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 space-y-1.5">
+                  <label className="block font-bold text-[#DC2626]">
+                    Aprovação do Administrador Obrigatória (PIN) *
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={refundAdminPin}
+                    onChange={(e) => setRefundAdminPin(e.target.value)}
+                    placeholder="PIN do Administrador (Padrão: 1234)"
+                    className="w-full px-3 py-1.5 rounded border border-red-300 dark:border-red-700 bg-white dark:bg-zinc-900 font-mono"
+                  />
+                </div>
+              )}
 
               <div className="flex justify-end gap-2 pt-3">
                 <button

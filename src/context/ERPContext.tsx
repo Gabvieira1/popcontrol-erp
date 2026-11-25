@@ -6,6 +6,8 @@ import {
   Supplier,
   CommercialGoal,
   BusinessSettings,
+  Role,
+  ShiftClosingRecord,
 } from '../types/domain';
 import {
   ActiveSession,
@@ -35,6 +37,8 @@ import {
   executeAccountTransfer,
   executeSettlePayable,
   executeSettleReceivable,
+  executeConfirmPendingPixSale,
+  executeCloseShift,
   executeSaveProduct,
   executeSaveSupplier,
   executeSaveCustomer,
@@ -67,6 +71,8 @@ export type ModuleKey =
 interface ERPContextValue {
   session: ActiveSession | null;
   setSession: (s: ActiveSession | null) => void;
+  activeRole: Role;
+  setActiveRole: (r: Role) => void;
   db: BusinessDatabaseState | null;
   isLoading: boolean;
   isOnline: boolean;
@@ -113,6 +119,12 @@ interface ERPContextValue {
     receivedAmountCents: number,
     accountId: string
   ) => Promise<void>;
+  confirmPendingPixSale: (saleId: string, accountId?: string) => Promise<void>;
+  closeShift: (payload: {
+    countedPhysicalCashCents: number;
+    confirmedPixReceivedCents: number;
+    notes?: string;
+  }) => Promise<ShiftClosingRecord>;
   saveProduct: (
     product: Omit<Product, 'id' | 'businessId' | 'createdAt' | 'updatedAt'> & { id?: string }
   ) => Promise<void>;
@@ -156,6 +168,7 @@ const ERPContext = createContext<ERPContextValue | undefined>(undefined);
 
 export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<ActiveSession | null>(() => getSavedSession());
+  const [activeRole, setActiveRole] = useState<Role>('admin');
   const [db, setDb] = useState<BusinessDatabaseState | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isOnline, setIsOnline] = useState<boolean>(() => navigator.onLine);
@@ -358,31 +371,44 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const createPosSale = useCallback(
     async (payload: CreateSalePayload): Promise<Sale> => {
       return runMutation<Sale>((current) => {
-        const { state, sale } = executePosSale(current, payload);
+        const { state, sale } = executePosSale(current, {
+          ...payload,
+          actingRole: payload.actingRole || activeRole,
+        });
         return { nextState: state, result: sale };
       }, 'Venda registrada com sucesso!');
     },
-    [runMutation]
+    [runMutation, activeRole]
   );
 
   const refundOrCancelSale = useCallback(
     async (payload: RefundSalePayload) => {
       await runMutation(
-        (current) => ({ nextState: executeRefundOrCancelSale(current, payload) }),
+        (current) => ({
+          nextState: executeRefundOrCancelSale(current, {
+            ...payload,
+            actingRole: payload.actingRole || activeRole,
+          }),
+        }),
         payload.mode === 'refunded' ? 'Venda estornada com sucesso.' : 'Venda cancelada com sucesso.'
       );
     },
-    [runMutation]
+    [runMutation, activeRole]
   );
 
   const adjustStockLot = useCallback(
     async (payload: ManualStockAdjustmentPayload) => {
       await runMutation(
-        (current) => ({ nextState: executeStockLotAdjustment(current, payload) }),
+        (current) => ({
+          nextState: executeStockLotAdjustment(current, {
+            ...payload,
+            actingRole: payload.actingRole || activeRole,
+          }),
+        }),
         'Movimentação de estoque registrada.'
       );
     },
-    [runMutation]
+    [runMutation, activeRole]
   );
 
   const reconcilePhysicalInventory = useCallback(
@@ -461,6 +487,32 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }),
         'Recebimento de título registrado no caixa.'
       );
+    },
+    [runMutation]
+  );
+
+  const confirmPendingPixSale = useCallback(
+    async (saleId: string, accountId?: string) => {
+      await runMutation(
+        (current) => ({
+          nextState: executeConfirmPendingPixSale(current, { saleId, accountId }),
+        }),
+        'Pagamento Pix confirmado e creditado no caixa!'
+      );
+    },
+    [runMutation]
+  );
+
+  const closeShift = useCallback(
+    async (payload: {
+      countedPhysicalCashCents: number;
+      confirmedPixReceivedCents: number;
+      notes?: string;
+    }): Promise<ShiftClosingRecord> => {
+      return runMutation<ShiftClosingRecord>((current) => {
+        const { state, closing } = executeCloseShift(current, payload);
+        return { nextState: state, result: closing };
+      }, 'Fechamento de turno registrado na auditoria!');
     },
     [runMutation]
   );
@@ -665,6 +717,8 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       value={{
         session,
         setSession,
+        activeRole,
+        setActiveRole,
         db,
         isLoading,
         isOnline,
@@ -687,6 +741,8 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         transferBetweenAccounts,
         settlePayable,
         settleReceivable,
+        confirmPendingPixSale,
+        closeShift,
         saveProduct,
         saveSupplier,
         saveCustomer,

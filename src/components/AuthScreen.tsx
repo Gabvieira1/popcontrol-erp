@@ -30,6 +30,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [email, setEmail] = useState('proprietario@popcontrol.com.br');
   const [password, setPassword] = useState('popcontrol123');
   const [displayName, setDisplayName] = useState('Proprietário Administrador');
+  const [adminInviteCode, setAdminInviteCode] = useState('POPADMIN');
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,6 +57,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         setInfo('Instruções de recuperação de senha registradas para o e-mail informado.');
         setMode('login');
       } else {
+        if (mode === 'signup' && adminInviteCode.trim().toUpperCase() !== 'POPADMIN') {
+          throw new Error(
+            'Código de autorização de Administrador inválido. Usuários não autorizados não podem ingressar na empresa existente.'
+          );
+        }
         const session = await loginWithEmailFirebase(
           email,
           password,
@@ -153,19 +159,34 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           {mode === 'signup' && (
-            <div>
-              <label className="block text-xs font-medium text-[#18181B] dark:text-zinc-300 mb-1">
-                Nome do Proprietário Administrador
-              </label>
-              <div className="relative">
-                <User className="w-4 h-4 text-[#71717A] absolute left-3 top-2.5" />
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-[#18181B] dark:text-zinc-300 mb-1">
+                  Nome do Proprietário Administrador
+                </label>
+                <div className="relative">
+                  <User className="w-4 h-4 text-[#71717A] absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    required
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-[#F6C344]"
+                    placeholder="Seu nome"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[#18181B] dark:text-zinc-300 mb-1">
+                  Chave de Autorização da Empresa (Proteção contra cadastro não autorizado)
+                </label>
                 <input
                   type="text"
                   required
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-[#F6C344]"
-                  placeholder="Seu nome"
+                  value={adminInviteCode}
+                  onChange={(e) => setAdminInviteCode(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+                  placeholder="POPADMIN"
                 />
               </div>
             </div>

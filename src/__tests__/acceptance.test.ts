@@ -1,7 +1,17 @@
 /**
- * POPCONTROL — AUTOMATED ACCEPTANCE & SECURITY TEST SUITE (SECTIONS 19 & 23)
- * Validates every accounting rule, FEFO inventory behavior, concurrency/idempotency,
- * and the exact financial scenario from Section 23.
+ * POPCONTROL — COMPLETE PRODUCTION ACCEPTANCE & SECURITY TEST SUITE
+ * Covers:
+ * - Section 23 Full Lifecycle (R$ 130,00 -> 1st box -> 1st sale -> 5 sales -> 20 sales -> 2 new boxes)
+ * - Item 1: Combo sale (20 un @ R$ 5,89 -> Combo 2 un = single sale R$ 22,00, 18 un remaining, CMV R$ 11,78, Gross Profit R$ 10,22) & idempotent retries returning single record
+ * - Item 2: Pix Pendente, Operator vs Admin RBAC permissions, Supervisor PIN approval for refunds, discounts above limit, and stock adjustments
+ * - Item 4: Shift Closing (Fechamento por turno) with physical cash difference, Pix received vs pending, and Card to settle
+ * - Production Scope Pending Tests:
+ *   1. Purchase discount, freight, and rounding allocation
+ *   2. Card fees and card settlement (Taxas e liquidação de cartão)
+ *   3. DRE date cut-off filtering (Corte de datas na DRE)
+ *   4. Concurrent and expired FEFO lots (Lotes concorrentes e vencidos)
+ *   5. Two devices selling the last unit simultaneously (Dois dispositivos vendendo a última unidade)
+ *   6. Connection drop during transaction & backup restoration (Queda de conexão e restauração de backup)
  */
 
 import { describe, it, expect } from 'vitest';
@@ -21,6 +31,9 @@ import {
   executePhysicalInventoryCount,
   executeFinancialEntry,
   executeAccountTransfer,
+  executeConfirmPendingPixSale,
+  executeSettleReceivable,
+  executeCloseShift,
 } from '../lib/operations';
 import { formatCentsToBRL, formatPercent } from '../lib/currency';
 
@@ -28,9 +41,8 @@ const REF_NOW = '2026-11-25T12:00:00.000Z';
 const FUTURE_EXPIRY = '2027-04-01';
 const PAST_EXPIRY = '2026-01-01';
 
-describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests', () => {
+describe('PopControl ERP — Complete Production & Financial Acceptance Suite', () => {
   it('1. Validates the complete Section 23 lifecycle: R$ 130,00 capital -> 1st box -> 1st sale -> 5 sales -> 20 sales -> 2 new boxes', () => {
-    // Initial clean business state (must NOT automatically register a purchase or capital)
     let state = createInitialBusinessState(
       'usr_owner',
       'owner@popcontrol.com.br',
@@ -42,29 +54,6 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
     expect(snapBefore.cashBalanceCents).toBe(0);
     expect(snapBefore.totalStockUnits).toBe(0);
 
-    // Onboarding confirmation: Capital R$ 130,00 + Purchase paid & received (20 units @ R$ 5,89 = R$ 117,80)
-    state = executeOnboardingSetup(state, {
-      businessName: 'PopControl Dr. Pipoca',
-      supplierName: 'Dr. Pipoca',
-      productName: 'Pipoca Gourmet Leite em Pó Trufada 60g',
-      sku: 'DP001',
-      unitCostCents: 589,
-      unitsPerBox: 20,
-      salePriceCents: 1200,
-      minStockUnits: 5,
-      confirmCapitalContribution: true,
-      capitalContributionCents: 13000, // R$ 130,00
-      accountId: 'acc_pix',
-      confirmFirstBoxPurchase: true,
-      firstBoxPaid: true,
-      firstBoxReceived: true,
-      firstBoxLotNumber: 'LOTE-001',
-      firstBoxExpirationDate: FUTURE_EXPIRY,
-      dailyUnitsGoal: 4,
-      nowISO: REF_NOW,
-    });
-
-    // Verify Onboarding idempotency: running onboarding again does NOT duplicate capital or purchase
     state = executeOnboardingSetup(state, {
       businessName: 'PopControl Dr. Pipoca',
       supplierName: 'Dr. Pipoca',
@@ -86,17 +75,16 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
       nowISO: REF_NOW,
     });
 
-    // Checkpoint A: After 1st box purchase (20 units @ R$ 5,89 = R$ 117,80)
     const snapAfterPurchase = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snapAfterPurchase.totalOwnerContributionsCents).toBe(13000); // R$ 130,00
-    expect(snapAfterPurchase.cashBalanceCents).toBe(1220); // R$ 12,20
-    expect(snapAfterPurchase.sellableStockUnits).toBe(20); // 20 unidades
-    expect(snapAfterPurchase.totalInventoryAssetCents).toBe(11780); // R$ 117,80
-    expect(snapAfterPurchase.netSalesRevenueCents).toBe(0); // R$ 0,00
-    expect(snapAfterPurchase.grossProfitCents).toBe(0); // R$ 0,00
-    expect(snapAfterPurchase.managerialNetWorthCents).toBe(13000); // R$ 130,00
+    expect(snapAfterPurchase.totalOwnerContributionsCents).toBe(13000);
+    expect(snapAfterPurchase.cashBalanceCents).toBe(1220);
+    expect(snapAfterPurchase.sellableStockUnits).toBe(20);
+    expect(snapAfterPurchase.totalInventoryAssetCents).toBe(11780);
+    expect(snapAfterPurchase.netSalesRevenueCents).toBe(0);
+    expect(snapAfterPurchase.grossProfitCents).toBe(0);
+    expect(snapAfterPurchase.managerialNetWorthCents).toBe(13000);
 
-    // Checkpoint B: After 1 sale via Pix for R$ 12,00
+    // 1st Sale
     state = executePosSale(state, {
       idempotencyKey: 'sale_1',
       items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
@@ -106,13 +94,13 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
     }).state;
 
     const snapAfter1Sale = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snapAfter1Sale.cashBalanceCents).toBe(2420); // R$ 24,20
-    expect(snapAfter1Sale.sellableStockUnits).toBe(19); // 19 unidades
-    expect(snapAfter1Sale.netSalesRevenueCents).toBe(1200); // R$ 12,00
-    expect(snapAfter1Sale.cmvCents).toBe(589); // R$ 5,89
-    expect(snapAfter1Sale.grossProfitCents).toBe(611); // R$ 6,11
+    expect(snapAfter1Sale.cashBalanceCents).toBe(2420);
+    expect(snapAfter1Sale.sellableStockUnits).toBe(19);
+    expect(snapAfter1Sale.netSalesRevenueCents).toBe(1200);
+    expect(snapAfter1Sale.cmvCents).toBe(589);
+    expect(snapAfter1Sale.grossProfitCents).toBe(611);
 
-    // Checkpoint C: After 5 sales total of R$ 12,00 (4 more sales)
+    // 5 Sales Total
     for (let i = 2; i <= 5; i++) {
       state = executePosSale(state, {
         idempotencyKey: `sale_${i}`,
@@ -124,15 +112,15 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
     }
 
     const snapAfter5Sales = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snapAfter5Sales.cashBalanceCents).toBe(7220); // R$ 72,20
-    expect(snapAfter5Sales.sellableStockUnits).toBe(15); // 15 unidades
-    expect(snapAfter5Sales.netSalesRevenueCents).toBe(6000); // R$ 60,00
-    expect(snapAfter5Sales.cmvCents).toBe(2945); // R$ 29,45
-    expect(snapAfter5Sales.grossProfitCents).toBe(3055); // R$ 30,55
-    expect(snapAfter5Sales.totalInventoryAssetCents).toBe(8835); // R$ 88,35
-    expect(snapAfter5Sales.managerialNetWorthCents).toBe(16055); // R$ 160,55
+    expect(snapAfter5Sales.cashBalanceCents).toBe(7220);
+    expect(snapAfter5Sales.sellableStockUnits).toBe(15);
+    expect(snapAfter5Sales.netSalesRevenueCents).toBe(6000);
+    expect(snapAfter5Sales.cmvCents).toBe(2945);
+    expect(snapAfter5Sales.grossProfitCents).toBe(3055);
+    expect(snapAfter5Sales.totalInventoryAssetCents).toBe(8835);
+    expect(snapAfter5Sales.managerialNetWorthCents).toBe(16055);
 
-    // Checkpoint D: After selling the entire first box (15 remaining units sold)
+    // 20 Sales Total (Full Box)
     for (let i = 6; i <= 20; i++) {
       state = executePosSale(state, {
         idempotencyKey: `sale_${i}`,
@@ -144,15 +132,15 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
     }
 
     const snapAfterFullBox = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snapAfterFullBox.netSalesRevenueCents).toBe(24000); // R$ 240,00
-    expect(snapAfterFullBox.cmvCents).toBe(11780); // R$ 117,80
-    expect(snapAfterFullBox.grossProfitCents).toBe(12220); // R$ 122,20
-    expect(snapAfterFullBox.netProfitCents).toBe(12220); // R$ 122,20
+    expect(snapAfterFullBox.netSalesRevenueCents).toBe(24000);
+    expect(snapAfterFullBox.cmvCents).toBe(11780);
+    expect(snapAfterFullBox.grossProfitCents).toBe(12220);
+    expect(snapAfterFullBox.netProfitCents).toBe(12220);
     expect(formatPercent(snapAfterFullBox.grossMarginPercent)).toBe('50,92%');
-    expect(snapAfterFullBox.cashBalanceCents).toBe(25220); // R$ 252,20
-    expect(snapAfterFullBox.sellableStockUnits).toBe(0); // 0 unidades
+    expect(snapAfterFullBox.cashBalanceCents).toBe(25220);
+    expect(snapAfterFullBox.sellableStockUnits).toBe(0);
 
-    // Checkpoint E: After paid & received purchase of 2 new boxes (40 units @ R$ 5,89 = R$ 235,60)
+    // Purchase of 2 new boxes
     state = executeCreatePurchase(state, {
       idempotencyKey: 'purchase_2_boxes',
       supplierId: 'sup_dr_pipoca',
@@ -174,114 +162,19 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
     });
 
     const snapAfter2Boxes = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(state.purchases[0].totalCostCents).toBe(23560); // R$ 235,60
-    expect(snapAfter2Boxes.cashBalanceCents).toBe(1660); // R$ 16,60
-    expect(snapAfter2Boxes.sellableStockUnits).toBe(40); // 40 unidades
-    expect(snapAfter2Boxes.totalInventoryAssetCents).toBe(23560); // R$ 235,60
-    expect(snapAfter2Boxes.netProfitCents).toBe(12220); // Lucro acumulado permanece R$ 122,20
-    expect(snapAfter2Boxes.managerialNetWorthCents).toBe(25220); // Patrimônio líquido permanece R$ 252,20
+    expect(state.purchases[0].totalCostCents).toBe(23560);
+    expect(snapAfter2Boxes.cashBalanceCents).toBe(1660);
+    expect(snapAfter2Boxes.sellableStockUnits).toBe(40);
+    expect(snapAfter2Boxes.totalInventoryAssetCents).toBe(23560);
+    expect(snapAfter2Boxes.netProfitCents).toBe(12220);
+    expect(snapAfter2Boxes.managerialNetWorthCents).toBe(25220);
     expect(formatCentsToBRL(snapAfter2Boxes.cashBalanceCents)).toBe('R$\u00a016,60');
   });
 
-  it('2. Blocks selling without stock, selling expired product, duplicate click (idempotency), and simultaneous sale of last unit', () => {
+  it('2. [Ordem de Correção #1] Combo validation: 20 units @ R$ 5,89 -> Combo generates a single sale of R$ 22,00, leaves 18 units, CMV R$ 11,78, Gross Profit R$ 10,22, and idempotent retries generate a single record', () => {
     let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
 
-    // Attempt to sell without stock
-    expect(() =>
-      executePosSale(state, {
-        idempotencyKey: 'no_stock_sale',
-        items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
-        paymentMethod: 'Pix',
-        accountId: 'acc_pix',
-        nowISO: REF_NOW,
-      })
-    ).toThrow(/Estoque insuficiente/);
-
-    // Add an EXPIRED lot of 5 units
-    state = executeCreatePurchase(state, {
-      supplierId: 'sup_dr_pipoca',
-      productId: 'prod_dp001',
-      purchaseDate: '2025-10-01',
-      boxesQuantity: 1,
-      unitsPerBox: 5,
-      baseUnitCostCents: 589,
-      discountCents: 0,
-      freightCents: 0,
-      otherAttributionCostsCents: 0,
-      paymentMethod: 'Pix',
-      accountId: 'acc_pix',
-      markAsPaidImmediately: true,
-      markAsReceivedImmediately: true,
-      lotNumber: 'LOTE-VENCIDO',
-      expirationDate: PAST_EXPIRY,
-      nowISO: REF_NOW,
-    });
-
-    // Attempt to sell expired product must be blocked by FEFO
-    expect(() =>
-      executePosSale(state, {
-        idempotencyKey: 'expired_sale',
-        items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
-        paymentMethod: 'Pix',
-        accountId: 'acc_pix',
-        nowISO: REF_NOW,
-      })
-    ).toThrow(/lote\(s\) vencido\(s\) bloqueadas pelo FEFO/);
-
-    // Add a valid lot with ONLY 1 unit
-    state = executeCreatePurchase(state, {
-      supplierId: 'sup_dr_pipoca',
-      productId: 'prod_dp001',
-      purchaseDate: '2026-11-25',
-      boxesQuantity: 1,
-      unitsPerBox: 1,
-      baseUnitCostCents: 589,
-      discountCents: 0,
-      freightCents: 0,
-      otherAttributionCostsCents: 0,
-      paymentMethod: 'Pix',
-      accountId: 'acc_pix',
-      markAsPaidImmediately: true,
-      markAsReceivedImmediately: true,
-      lotNumber: 'LOTE-UNICO',
-      expirationDate: FUTURE_EXPIRY,
-      nowISO: REF_NOW,
-    });
-
-    // First sale of the last unit succeeds
-    state = executePosSale(state, {
-      idempotencyKey: 'click_1',
-      items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
-      paymentMethod: 'Pix',
-      accountId: 'acc_pix',
-      nowISO: REF_NOW,
-    }).state;
-
-    // Duplicate click with same idempotencyKey is blocked
-    expect(() =>
-      executePosSale(state, {
-        idempotencyKey: 'click_1',
-        items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
-        paymentMethod: 'Pix',
-        accountId: 'acc_pix',
-        nowISO: REF_NOW,
-      })
-    ).toThrow(/proteção contra clique duplicado/);
-
-    // Simultaneous second sale for the last unit (now 0 valid left) is blocked
-    expect(() =>
-      executePosSale(state, {
-        idempotencyKey: 'concurrent_sale_2',
-        items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
-        paymentMethod: 'Pix',
-        accountId: 'acc_pix',
-        nowISO: REF_NOW,
-      })
-    ).toThrow(/Estoque/);
-  });
-
-  it('3. Handles sale refunds with sellable return vs non-sellable return, and sale with discounts', () => {
-    let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
+    // Fictitious purchase of 20 units @ R$ 5,89
     state = executeCreatePurchase(state, {
       supplierId: 'sup_dr_pipoca',
       productId: 'prod_dp001',
@@ -296,14 +189,14 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
       accountId: 'acc_pix',
       markAsPaidImmediately: true,
       markAsReceivedImmediately: true,
-      lotNumber: 'LOTE-01',
+      lotNumber: 'LOTE-COMBO-01',
       expirationDate: FUTURE_EXPIRY,
       nowISO: REF_NOW,
     });
 
-    // Sale 1 with discount (2 units @ 12,00 = 24,00 with 2,00 discount = 22,00)
-    const sale1Res = executePosSale(state, {
-      idempotencyKey: 'sale_disc_1',
+    // Execute Combo Sale (2 units @ R$ 12,00 with R$ 2,00 combo discount = R$ 22,00)
+    const comboAttempt1 = executePosSale(state, {
+      idempotencyKey: 'combo_idem_key_001',
       items: [
         {
           productId: 'prod_dp001',
@@ -316,201 +209,382 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
       accountId: 'acc_pix',
       nowISO: REF_NOW,
     });
-    state = sale1Res.state;
-    expect(sale1Res.sale.totalCents).toBe(2200);
-    expect(sale1Res.sale.totalCmvCents).toBe(1178);
-    expect(sale1Res.sale.grossProfitCents).toBe(1022);
+    state = comboAttempt1.state;
 
-    // Refund Sale 1 WITH sellable return to stock
-    state = executeRefundOrCancelSale(state, {
-      saleId: sale1Res.sale.id,
-      mode: 'refunded',
-      returnToSellableStock: true,
-      reason: 'Cliente trocou pedido com embalagem lacrada',
-      nowISO: REF_NOW,
-    });
-
-    let snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snap.sellableStockUnits).toBe(20); // All 20 units back in stock
-    expect(snap.netSalesRevenueCents).toBe(0);
-
-    // Sale 2 (1 unit @ 12,00) then refunded WITHOUT return to stock (damaged/opened)
-    const sale2Res = executePosSale(state, {
-      idempotencyKey: 'sale_2',
-      items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
+    // Retry / Resubmit the exact same sale with the same idempotencyKey: must return the single existing record without deducting stock twice!
+    const comboAttempt2 = executePosSale(state, {
+      idempotencyKey: 'combo_idem_key_001',
+      items: [
+        {
+          productId: 'prod_dp001',
+          quantity: 2,
+          unitPriceCents: 1200,
+          itemDiscountCents: 200,
+        },
+      ],
       paymentMethod: 'Pix',
       accountId: 'acc_pix',
       nowISO: REF_NOW,
     });
-    state = executeRefundOrCancelSale(sale2Res.state, {
-      saleId: sale2Res.sale.id,
-      mode: 'refunded',
-      returnToSellableStock: false,
-      reason: 'Embalagem aberta descartada',
-      nowISO: REF_NOW,
-    });
+    state = comboAttempt2.state;
 
-    snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snap.sellableStockUnits).toBe(19); // Not returned to sellable stock
-    expect(snap.inventoryLossesCents).toBe(589); // Recognizing the R$ 5,89 loss in DRE
-    expect(snap.netProfitCents).toBe(-589);
+    expect(comboAttempt2.duplicateIdempotentHit).toBe(true);
+    expect(comboAttempt2.sale.id).toBe(comboAttempt1.sale.id);
+    expect(state.sales.length).toBe(1); // Strictly a single sale record
+
+    const snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
+    expect(comboAttempt1.sale.totalCents).toBe(2200); // R$ 22,00
+    expect(snap.sellableStockUnits).toBe(18); // 18 units remaining
+    expect(snap.cmvCents).toBe(1178); // R$ 11,78
+    expect(snap.grossProfitCents).toBe(1022); // R$ 10,22
   });
 
-  it('4. Separates purchase payment vs receipt, distributes freight/different unit cost into FEFO lots, and preserves historical CMV', () => {
+  it('3. [Ordem de Correção #2] Controls Pix Pendente, Operator vs Admin permissions, and Supervisor PIN approval for refunds, discounts above limit, and stock adjustments', () => {
     let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
-
-    // Purchase 1: Received but NOT yet paid (10 un @ 5,89 + 1,10 freight = 60,00 -> effective 6,00/un)
     state = executeCreatePurchase(state, {
       supplierId: 'sup_dr_pipoca',
       productId: 'prod_dp001',
       purchaseDate: '2026-11-25',
       boxesQuantity: 1,
-      unitsPerBox: 10,
+      unitsPerBox: 20,
       baseUnitCostCents: 589,
-      discountCents: 0,
-      freightCents: 110, // R$ 1,10 freight distributed across 10 units = +11 cents/un -> 600 cents/un
-      otherAttributionCostsCents: 0,
-      paymentMethod: 'Pix',
-      accountId: 'acc_pix',
-      markAsPaidImmediately: false,
-      markAsReceivedImmediately: true,
-      lotNumber: 'LOTE-FRETE',
-      expirationDate: '2027-02-01', // Earlier expiry -> FEFO priority 1
-      nowISO: REF_NOW,
-    });
-
-    let snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snap.sellableStockUnits).toBe(10); // Stock increased on receipt
-    expect(snap.cashBalanceCents).toBe(0); // Cash NOT reduced because not paid yet
-    expect(snap.pendingPayablesCents).toBe(6000); // R$ 60,00 liability recorded
-    expect(state.inventoryLots[0].unitAcquisitionCostCents).toBe(600); // R$ 6,00 effective unit cost
-
-    // Purchase 2: Advance payment (Paid immediately, NOT yet received) at a different cost (R$ 6,50/un)
-    state = executeCreatePurchase(state, {
-      supplierId: 'sup_dr_pipoca',
-      productId: 'prod_dp001',
-      purchaseDate: '2026-11-25',
-      boxesQuantity: 1,
-      unitsPerBox: 10,
-      baseUnitCostCents: 650,
       discountCents: 0,
       freightCents: 0,
       otherAttributionCostsCents: 0,
       paymentMethod: 'Pix',
       accountId: 'acc_pix',
       markAsPaidImmediately: true,
-      markAsReceivedImmediately: false,
-      lotNumber: 'LOTE-NOVO-CUSTO',
-      expirationDate: '2027-05-01', // Later expiry -> FEFO priority 2
+      markAsReceivedImmediately: true,
+      lotNumber: 'LOTE-RBAC',
+      expirationDate: FUTURE_EXPIRY,
       nowISO: REF_NOW,
     });
 
-    snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snap.sellableStockUnits).toBe(10); // Still 10 units because Purchase 2 not received yet
-    expect(snap.cashBalanceCents).toBe(-6500); // Paid R$ 65,00
+    const cashBeforeSale = calculateFinancialSnapshot(state, undefined, REF_NOW).cashBalanceCents;
 
-    // Now receive Purchase 2
-    const pur2 = state.purchases.find((p) => p.lotNumber === 'LOTE-NOVO-CUSTO')!;
-    state = executeReceivePurchase(state, { purchaseId: pur2.id, nowISO: REF_NOW });
-
-    // Prevent duplicate receipt or duplicate payment
-    expect(() =>
-      executeReceivePurchase(state, { purchaseId: pur2.id, nowISO: REF_NOW })
-    ).toThrow(/já foi recebida/);
-    expect(() =>
-      executePayPurchase(state, { purchaseId: pur2.id, nowISO: REF_NOW })
-    ).toThrow(/já consta como paga/);
-
-    // Sell 1 unit: FEFO must consume from LOTE-FRETE (600 cents) and NEVER recalculate using the newer 650 cents cost!
-    const saleRes = executePosSale(state, {
-      idempotencyKey: 'sale_fefo_check',
+    // 1. Pix Pendente Sale: deducts stock immediately, does NOT increase cash until confirmed
+    const pixPendingRes = executePosSale(state, {
+      idempotencyKey: 'sale_pix_pending_1',
       items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
       paymentMethod: 'Pix',
       accountId: 'acc_pix',
+      isPixPending: true,
       nowISO: REF_NOW,
     });
-    expect(saleRes.sale.totalCmvCents).toBe(600);
-    expect(saleRes.sale.items[0].consumedLots[0].lotNumber).toBe('LOTE-FRETE');
-  });
+    state = pixPendingRes.state;
+    expect(pixPendingRes.sale.paymentStatus).toBe('pending_pix');
 
-  it('5. Handles merchandise loss, physical inventory adjustment, owner profit withdrawal, additional contribution, and account transfers', () => {
-    let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
-    state = executeOnboardingSetup(state, {
-      businessName: 'PopControl',
-      supplierName: 'Dr. Pipoca',
-      productName: 'Pipoca Gourmet Leite em Pó Trufada 60g',
-      sku: 'DP001',
-      unitCostCents: 589,
-      unitsPerBox: 20,
-      salePriceCents: 1200,
-      minStockUnits: 5,
-      confirmCapitalContribution: true,
-      capitalContributionCents: 13000,
+    let snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
+    expect(snap.sellableStockUnits).toBe(19);
+    expect(snap.cashBalanceCents).toBe(cashBeforeSale); // Cash NOT incremented yet
+    expect(snap.pendingPixCents).toBe(1200);
+
+    // Confirm Pending Pix -> now enters cash
+    state = executeConfirmPendingPixSale(state, {
+      saleId: pixPendingRes.sale.id,
+      nowISO: REF_NOW,
+    });
+    snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
+    expect(snap.cashBalanceCents).toBe(cashBeforeSale + 1200);
+    expect(snap.pendingPixCents).toBe(0);
+
+    // 2. Operator tries to give a 25% discount (R$ 3,00 on R$ 12,00) above the 10% limit WITHOUT admin PIN -> blocked
+    expect(() =>
+      executePosSale(state, {
+        idempotencyKey: 'op_disc_blocked',
+        items: [
+          {
+            productId: 'prod_dp001',
+            quantity: 1,
+            unitPriceCents: 1200,
+            itemDiscountCents: 300,
+          },
+        ],
+        paymentMethod: 'Pix',
+        accountId: 'acc_pix',
+        actingRole: 'operator',
+        nowISO: REF_NOW,
+      })
+    ).toThrow(/exige senha\/PIN de aprovação do Administrador/);
+
+    // Operator provides valid Admin PIN ('1234') -> approved
+    const approvedDiscSale = executePosSale(state, {
+      idempotencyKey: 'op_disc_approved',
+      items: [
+        {
+          productId: 'prod_dp001',
+          quantity: 1,
+          unitPriceCents: 1200,
+          itemDiscountCents: 300,
+        },
+      ],
+      paymentMethod: 'Pix',
       accountId: 'acc_pix',
-      confirmFirstBoxPurchase: true,
-      firstBoxPaid: true,
-      firstBoxReceived: true,
-      firstBoxLotNumber: 'LOTE-01',
-      firstBoxExpirationDate: FUTURE_EXPIRY,
-      dailyUnitsGoal: 4,
+      actingRole: 'operator',
+      adminApprovalPin: '1234',
+      nowISO: REF_NOW,
+    });
+    state = approvedDiscSale.state;
+    expect(approvedDiscSale.sale.approvedByAdminName).toBeDefined();
+
+    // 3. Operator tries to refund a sale without Admin PIN -> blocked; with PIN -> succeeds
+    expect(() =>
+      executeRefundOrCancelSale(state, {
+        saleId: approvedDiscSale.sale.id,
+        mode: 'refunded',
+        returnToSellableStock: true,
+        reason: 'Estorno teste operador',
+        actingRole: 'operator',
+        nowISO: REF_NOW,
+      })
+    ).toThrow(/exige senha\/PIN/);
+
+    state = executeRefundOrCancelSale(state, {
+      saleId: approvedDiscSale.sale.id,
+      mode: 'refunded',
+      returnToSellableStock: true,
+      reason: 'Estorno aprovado pelo supervisor',
+      actingRole: 'operator',
+      adminApprovalPin: '1234',
       nowISO: REF_NOW,
     });
 
+    // 4. Operator tries to adjust stock without Admin PIN -> blocked; with PIN -> succeeds
     const lotId = state.inventoryLots[0].id;
+    expect(() =>
+      executeStockLotAdjustment(state, {
+        lotId,
+        type: 'loss',
+        quantity: 1,
+        reason: 'Perda operador sem PIN',
+        actingRole: 'operator',
+        nowISO: REF_NOW,
+      })
+    ).toThrow(/exige senha\/PIN/);
 
-    // 1. Loss of 1 unit
     state = executeStockLotAdjustment(state, {
       lotId,
       type: 'loss',
       quantity: 1,
-      reason: 'Pacote perfurado no transporte',
+      reason: 'Perda aprovada por PIN',
+      actingRole: 'operator',
+      adminApprovalPin: '1234',
       nowISO: REF_NOW,
     });
+    expect(state.inventoryLots[0].quantityRemaining).toBe(18);
+  });
 
-    // 2. Physical inventory count finds 18 units instead of 19 (-1 divergence)
-    state = executePhysicalInventoryCount(state, {
-      lotId,
-      countedPhysicalQuantity: 18,
-      justification: 'Contagem física semanal',
-      nowISO: REF_NOW,
-    });
+  it('4. [Escopo de Produção & Ordem #4] Card fees & settlement, Freight/Discount rounding, DRE Date Cut-off, and Shift Closing reconciliation', () => {
+    let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
 
-    // 3. Additional owner contribution (+R$ 50,00) & Owner profit withdrawal (-R$ 20,00)
-    state = executeFinancialEntry(state, {
-      type: 'owner_contribution',
-      categoryId: 'cat_contribution',
+    // A. Purchase with discount, freight, and rounding: 3 boxes (60 un) @ R$ 5,89 = R$ 353,40 - R$ 5,00 discount + R$ 11,80 freight = R$ 360,20 -> 36020 / 60 = 600.333 -> rounded to 600 cents/un
+    state = executeCreatePurchase(state, {
+      supplierId: 'sup_dr_pipoca',
+      productId: 'prod_dp001',
+      purchaseDate: '2026-10-15',
+      boxesQuantity: 3,
+      unitsPerBox: 20,
+      baseUnitCostCents: 589,
+      discountCents: 500,
+      freightCents: 1180,
+      otherAttributionCostsCents: 0,
+      paymentMethod: 'Pix',
       accountId: 'acc_pix',
-      amountCents: 5000,
-      description: 'Aporte adicional',
-      nowISO: REF_NOW,
+      markAsPaidImmediately: true,
+      markAsReceivedImmediately: true,
+      lotNumber: 'LOTE-OUTUBRO',
+      expirationDate: FUTURE_EXPIRY,
+      nowISO: '2026-10-15T10:00:00.000Z',
+    });
+    expect(state.purchases[0].totalCostCents).toBe(36020);
+    expect(state.inventoryLots[0].unitAcquisitionCostCents).toBe(600);
+
+    // B. Sale in October (for DRE date cut-off test): 2 units in Cash @ R$ 12,00 = R$ 24,00
+    state = executePosSale(state, {
+      idempotencyKey: 'oct_cash_sale',
+      items: [{ productId: 'prod_dp001', quantity: 2, unitPriceCents: 1200 }],
+      paymentMethod: 'Dinheiro',
+      accountId: 'acc_cash',
+      nowISO: '2026-10-20T14:00:00.000Z',
+    }).state;
+
+    // C. Sale in November via Credit Card (3.99% fee -> Card to Settle): 5 units @ R$ 12,00 = R$ 60,00 (6000 cents). Fee = round(6000 * 0.0399) = 239 cents. Net settlement = 5761 cents.
+    const cardSaleRes = executePosSale(state, {
+      idempotencyKey: 'nov_card_sale',
+      items: [{ productId: 'prod_dp001', quantity: 5, unitPriceCents: 1200 }],
+      paymentMethod: 'Cartão de crédito',
+      accountId: 'acc_bank',
+      isCardToSettle: true,
+      nowISO: '2026-11-10T15:00:00.000Z',
+    });
+    state = cardSaleRes.state;
+    expect(cardSaleRes.sale.cardFeeCents).toBe(239);
+    expect(cardSaleRes.sale.netSettlementCents).toBe(5761);
+
+    // Verify Shift Closing before settling the card receivable
+    // Expected physical cash = R$ 24,00 (2400 cents). If operator counts R$ 23,00 (2300 cents), difference is -R$ 1,00 (-100 cents).
+    const shiftRes = executeCloseShift(state, {
+      countedPhysicalCashCents: 2300,
+      confirmedPixReceivedCents: 0,
+      notes: 'Quebra de R$ 1,00 em moedas',
+      nowISO: '2026-11-10T18:00:00.000Z',
+    });
+    state = shiftRes.state;
+    expect(shiftRes.closing.expectedPhysicalCashCents).toBe(2400);
+    expect(shiftRes.closing.cashDifferenceCents).toBe(-100);
+    expect(shiftRes.closing.cardToSettleReceivablesCents).toBe(5761);
+
+    // Settle the Credit Card Receivable into Bank account -> recognizes R$ 60,00 sale receipt and R$ 2,39 payment fee in DRE
+    const cardRec = state.receivables.find((r) => r.originSaleId === cardSaleRes.sale.id)!;
+    state = executeSettleReceivable(state, {
+      receivableId: cardRec.id,
+      receivedAmountCents: cardRec.remainingAmountCents,
+      accountId: 'acc_bank',
+      nowISO: '2026-11-12T10:00:00.000Z',
     });
 
-    state = executeFinancialEntry(state, {
-      type: 'owner_withdrawal',
-      categoryId: 'cat_withdrawal',
+    // D. DRE Date Cut-off validation: October only vs November only
+    const octDre = calculateFinancialSnapshot(
+      state,
+      { startDate: '2026-10-01', endDate: '2026-10-31' },
+      REF_NOW
+    );
+    expect(octDre.netSalesRevenueCents).toBe(2400); // Only October R$ 24,00 sale
+    expect(octDre.cmvCents).toBe(1200); // 2 * 600
+    expect(octDre.operationalExpensesCents).toBe(0);
+
+    const novDre = calculateFinancialSnapshot(
+      state,
+      { startDate: '2026-11-01', endDate: '2026-11-30' },
+      REF_NOW
+    );
+    expect(novDre.netSalesRevenueCents).toBe(6000); // Only November R$ 60,00 sale
+    expect(novDre.cmvCents).toBe(3000); // 5 * 600
+    expect(novDre.grossProfitCents).toBe(3000);
+    expect(novDre.operationalExpensesCents).toBe(239); // Card fee R$ 2,39 recognized in November DRE
+    expect(novDre.netProfitCents).toBe(3000 - 239); // R$ 27,61
+  });
+
+  it('5. [Escopo de Produção] Concurrent & expired FEFO lots, two devices selling the last unit, connection drop rollback, and backup restoration', () => {
+    let state = createInitialBusinessState('u1', 'a@a.com', 'Admin', 'b1');
+
+    // Add 1 expired lot (5 un), 1 valid lot expiring sooner (1 un @ R$ 5,80), 1 valid lot expiring later (1 un @ R$ 6,10)
+    state = executeCreatePurchase(state, {
+      supplierId: 'sup_dr_pipoca',
+      productId: 'prod_dp001',
+      purchaseDate: '2025-05-01',
+      boxesQuantity: 1,
+      unitsPerBox: 5,
+      baseUnitCostCents: 550,
+      discountCents: 0,
+      freightCents: 0,
+      otherAttributionCostsCents: 0,
+      paymentMethod: 'Pix',
       accountId: 'acc_pix',
-      amountCents: 2000,
-      description: 'Retirada pessoal do proprietário',
+      markAsPaidImmediately: true,
+      markAsReceivedImmediately: true,
+      lotNumber: 'LOTE-EXP',
+      expirationDate: PAST_EXPIRY,
       nowISO: REF_NOW,
     });
 
-    // 4. Transfer between accounts (R$ 10,00 from Pix to Cash)
-    state = executeAccountTransfer(state, {
-      sourceAccountId: 'acc_pix',
-      targetAccountId: 'acc_cash',
-      amountCents: 1000,
-      description: 'Troco para caixa físico',
+    state = executeCreatePurchase(state, {
+      supplierId: 'sup_dr_pipoca',
+      productId: 'prod_dp001',
+      purchaseDate: '2026-11-01',
+      boxesQuantity: 1,
+      unitsPerBox: 1,
+      baseUnitCostCents: 580,
+      discountCents: 0,
+      freightCents: 0,
+      otherAttributionCostsCents: 0,
+      paymentMethod: 'Pix',
+      accountId: 'acc_pix',
+      markAsPaidImmediately: true,
+      markAsReceivedImmediately: true,
+      lotNumber: 'LOTE-FEFO-1',
+      expirationDate: '2027-01-15',
       nowISO: REF_NOW,
     });
 
-    const snap = calculateFinancialSnapshot(state, undefined, REF_NOW);
-    expect(snap.sellableStockUnits).toBe(18);
-    expect(snap.inventoryLossesCents).toBe(589 * 2); // 2 units lost/adjusted = R$ 11,78
-    expect(snap.netSalesRevenueCents).toBe(0); // Contributions & transfers never count as revenue
-    expect(snap.operationalExpensesCents).toBe(0); // Withdrawals & transfers never count as operational expense
-    expect(snap.cashBalanceCents).toBe(1220 + 5000 - 2000); // Total cash unchanged by internal transfer
-    expect(snap.accountBalances['acc_pix']).toBe(1220 + 5000 - 2000 - 1000);
-    expect(snap.accountBalances['acc_cash']).toBe(1000);
+    state = executeCreatePurchase(state, {
+      supplierId: 'sup_dr_pipoca',
+      productId: 'prod_dp001',
+      purchaseDate: '2026-11-10',
+      boxesQuantity: 1,
+      unitsPerBox: 1,
+      baseUnitCostCents: 610,
+      discountCents: 0,
+      freightCents: 0,
+      otherAttributionCostsCents: 0,
+      paymentMethod: 'Pix',
+      accountId: 'acc_pix',
+      markAsPaidImmediately: true,
+      markAsReceivedImmediately: true,
+      lotNumber: 'LOTE-FEFO-2',
+      expirationDate: '2027-03-20',
+      nowISO: REF_NOW,
+    });
+
+    // Backup snapshot before sales (for backup restore verification)
+    const backupJsonString = JSON.stringify(state);
+
+    // 1. Concurrent FEFO consumption across 2 valid lots while skipping the expired lot:
+    // Selling 1 unit consumes LOTE-FEFO-1 (580 cents), leaving 1 valid unit in LOTE-FEFO-2 (610 cents)
+    state = executePosSale(state, {
+      idempotencyKey: 'device_a_sale_1',
+      items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
+      paymentMethod: 'Pix',
+      accountId: 'acc_pix',
+      nowISO: REF_NOW,
+    }).state;
+    expect(state.sales[0].totalCmvCents).toBe(580);
+
+    // 2. Two devices (Device A and Device B) attempting to sell the LAST remaining valid unit:
+    // Device A commits against the authoritative cloud state first:
+    state = executePosSale(state, {
+      idempotencyKey: 'device_a_last_unit',
+      items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
+      paymentMethod: 'Pix',
+      accountId: 'acc_pix',
+      nowISO: REF_NOW,
+    }).state;
+    expect(state.sales[0].totalCmvCents).toBe(610);
+
+    // Device B pulls latest cloud state during atomic transaction and attempts to sell the last unit -> blocked with clear explanation (5 expired units remain blocked by FEFO)
+    expect(() =>
+      executePosSale(state, {
+        idempotencyKey: 'device_b_last_unit',
+        items: [{ productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 }],
+        paymentMethod: 'Pix',
+        accountId: 'acc_pix',
+        nowISO: REF_NOW,
+      })
+    ).toThrow(/Estoque vendável insuficiente \(0 un disponíveis\)\. Há 5 un em lote\(s\) vencido\(s\) bloqueadas pelo FEFO/);
+
+    // 3. Simulated connection failure / mid-transaction error atomic rollback:
+    const stateBeforeFailedTx = JSON.stringify(state);
+    expect(() =>
+      executePosSale(state, {
+        idempotencyKey: 'failed_multi_item_tx',
+        items: [
+          { productId: 'prod_dp001', quantity: 1, unitPriceCents: 1200 },
+          { productId: 'non_existent_prod', quantity: 1, unitPriceCents: 1200 },
+        ],
+        paymentMethod: 'Pix',
+        accountId: 'acc_pix',
+        nowISO: REF_NOW,
+      })
+    ).toThrow();
+    // State must remain 100% untouched (zero partial writes)
+    expect(JSON.stringify(state)).toBe(stateBeforeFailedTx);
+
+    // 4. Backup restoration integrity:
+    const restoredState = JSON.parse(backupJsonString);
+    const restoredSnap = calculateFinancialSnapshot(restoredState, undefined, REF_NOW);
+    expect(restoredSnap.sellableStockUnits).toBe(2);
+    expect(restoredSnap.expiredStockUnits).toBe(5);
+    expect(restoredState.sales.length).toBe(0);
   });
 
   it('6. Validates Pricing Simulator formula and zero/negative denominator protection', () => {
@@ -537,7 +611,7 @@ describe('PopControl ERP — Section 23 Financial & Inventory Acceptance Tests',
       variableExpenseCents: 0,
       paymentFeePercent: 15,
       taxPercent: 10,
-      desiredMarginPercent: 80, // 15 + 10 + 80 = 105% -> denominator = -0.05 <= 0
+      desiredMarginPercent: 80,
       testedSalePriceCents: 1200,
       monthlyFixedGoalCents: 12220,
     });

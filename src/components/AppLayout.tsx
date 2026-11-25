@@ -64,6 +64,8 @@ export const AppLayout: React.FC<{
   const {
     db,
     session,
+    activeRole,
+    setActiveRole,
     activeModule,
     setActiveModule,
     isOnline,
@@ -87,7 +89,7 @@ export const AppLayout: React.FC<{
   };
 
   return (
-    <div className="min-h-screen flex bg-[#F7F8FA] dark:bg-zinc-950 text-[#18181B] dark:text-zinc-100">
+    <div className="min-h-screen flex bg-[#F7F8FA] dark:bg-zinc-950 text-[#18181B] dark:text-zinc-100 overflow-x-hidden max-w-[100vw]">
       {/* Desktop Collapsible Sidebar */}
       <aside
         className={`hidden md:flex flex-col border-r border-[#E4E4E7] dark:border-zinc-800 bg-white dark:bg-zinc-900 transition-all duration-200 shrink-0 print:hidden ${
@@ -199,7 +201,22 @@ export const AppLayout: React.FC<{
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            {/* Active Profile Selector: Admin vs Operator */}
+            <select
+              value={activeRole}
+              onChange={(e) => setActiveRole(e.target.value as 'admin' | 'operator')}
+              className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${
+                activeRole === 'admin'
+                  ? 'bg-zinc-100 dark:bg-zinc-800 border-[#E4E4E7] dark:border-zinc-700 text-[#18181B] dark:text-white'
+                  : 'bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-800 text-[#A16207] dark:text-[#F6C344]'
+              }`}
+              title="Alternar Perfil de Acesso (Administrador vs Operador de Caixa)"
+            >
+              <option value="admin">Perfil: Admin</option>
+              <option value="operator">Perfil: Operador</option>
+            </select>
+
             <button
               type="button"
               onClick={() => setScannerOpen(true)}

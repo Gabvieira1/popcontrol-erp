@@ -470,25 +470,85 @@ export const PurchasesModule: React.FC = () => {
                 </div>
               </div>
 
-              {/* Cost Allocation Summary */}
-              <div className="p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800/80 border border-[#E4E4E7] dark:border-zinc-700 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <span className="text-[#71717A] block">Quantidade Total</span>
-                  <strong className="font-mono text-sm">{totalUnits} unidades</strong>
-                </div>
-                <div>
-                  <span className="text-[#71717A] block">Custo Unitário Efetivo (c/ Frete/Desc.)</span>
-                  <strong className="font-mono text-sm">
-                    {formatCentsToBRL(effectiveUnitCostCents)}/un
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-[#71717A] block">Valor Total da Compra</span>
-                  <strong className="font-mono text-base text-[#18181B] dark:text-[#F6C344]">
-                    {formatCentsToBRL(totalCostCents)}
-                  </strong>
-                </div>
-              </div>
+              {/* Cost Allocation & Cash Impact Preview before saving (Item 4) */}
+              {(() => {
+                const currentAccountBalCents =
+                  snapshot.accountBalances[accountId] ?? 0;
+                const projectedAccountBalCents = markPaid
+                  ? currentAccountBalCents - totalCostCents
+                  : currentAccountBalCents;
+                const projectedTotalCashCents = markPaid
+                  ? snapshot.cashBalanceCents - totalCostCents
+                  : snapshot.cashBalanceCents;
+                const willGoNegative =
+                  markPaid &&
+                  (projectedAccountBalCents < 0 || projectedTotalCashCents < 0);
+
+                return (
+                  <div className="space-y-2.5">
+                    <div className="p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800/80 border border-[#E4E4E7] dark:border-zinc-700 grid grid-cols-2 sm:grid-cols-5 gap-3">
+                      <div>
+                        <span className="text-[#71717A] text-[10px] block">Qtd. Total</span>
+                        <strong className="font-mono text-sm">{totalUnits} un</strong>
+                      </div>
+                      <div>
+                        <span className="text-[#71717A] text-[10px] block">
+                          Custo Unit. Efetivo
+                        </span>
+                        <strong className="font-mono text-sm">
+                          {formatCentsToBRL(effectiveUnitCostCents)}/un
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-[#71717A] text-[10px] block">
+                          Valor Total Compra
+                        </span>
+                        <strong className="font-mono text-sm text-[#18181B] dark:text-[#F6C344]">
+                          {formatCentsToBRL(totalCostCents)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-[#71717A] text-[10px] block">
+                          Saldo Atual da Conta
+                        </span>
+                        <strong className="font-mono text-sm">
+                          {formatCentsToBRL(currentAccountBalCents)}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-[#71717A] text-[10px] block">
+                          Saldo Previsto Após Salvar
+                        </span>
+                        <strong
+                          className={`font-mono text-sm ${
+                            projectedAccountBalCents < 0
+                              ? 'text-[#DC2626]'
+                              : 'text-[#16A34A]'
+                          }`}
+                        >
+                          {formatCentsToBRL(projectedAccountBalCents)}
+                        </strong>
+                      </div>
+                    </div>
+
+                    {willGoNegative && (
+                      <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/50 border-2 border-[#DC2626] text-[#DC2626] dark:text-red-300 flex items-start gap-2.5 text-xs">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                        <div>
+                          <strong className="block">
+                            Alerta de Saldo Negativo em Caixa!
+                          </strong>
+                          <span>
+                            O pagamento imediato desta compra ({formatCentsToBRL(totalCostCents)}) deixará o saldo da conta selecionada negativo em{' '}
+                            <strong>{formatCentsToBRL(projectedAccountBalCents)}</strong> (Caixa total previsto:{' '}
+                            {formatCentsToBRL(projectedTotalCashCents)}). Registre um aporte prévio ou desmarque "Pagamento já realizado" para lançar como Conta a Pagar.
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               <div className="flex flex-wrap gap-6 pt-1">
                 <label className="flex items-center gap-2 font-medium cursor-pointer">

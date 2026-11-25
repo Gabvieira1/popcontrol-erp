@@ -49,6 +49,31 @@ export interface AlertPreferences {
   payableDueWarningDays: number; // e.g. 5
 }
 
+export interface RolePermissionsConfig {
+  operatorMaxDiscountPercent: number; // Default 10% (above requires admin PIN/approval)
+  adminPinCode: string; // Default '1234' for supervisor approval on operator actions
+  debitCardFeePercent: number; // e.g. 1.99%
+  creditCardFeePercent: number; // e.g. 3.99%
+  cardSettlementDays: number; // e.g. 1 day for debit, 30 for credit
+}
+
+export interface ShiftClosingRecord {
+  id: string;
+  businessId: string;
+  openedAt: string;
+  closedAt: string;
+  closedByUserId: string;
+  closedByUserName: string;
+  expectedPhysicalCashCents: number;
+  countedPhysicalCashCents: number;
+  cashDifferenceCents: number; // counted - expected
+  expectedPixReceivedCents: number;
+  confirmedPixReceivedCents: number;
+  pixPendingCents: number;
+  cardToSettleReceivablesCents: number;
+  notes?: string;
+}
+
 export interface BusinessSettings {
   id: string;
   businessId: string;
@@ -67,6 +92,7 @@ export interface BusinessSettings {
   loyaltyRules: LoyaltyRules;
   segmentationRules: CustomerSegmentationRules;
   alertPreferences: AlertPreferences;
+  permissionsConfig?: RolePermissionsConfig;
   onboardingCompleted: boolean;
   initialCapitalConfirmed: boolean;
   initialPurchaseConfirmed: boolean;
@@ -254,6 +280,7 @@ export interface SaleItem {
 }
 
 export type SaleStatus = 'completed' | 'cancelled' | 'refunded';
+export type SalePaymentStatus = 'received' | 'pending_pix' | 'pending_card_settlement' | 'pending_receivable';
 
 export interface Sale {
   id: string;
@@ -271,10 +298,14 @@ export interface Sale {
   totalCents: number; // Final sale amount charged
   totalCmvCents: number; // Total historical CMV of paid items
   promotionalLoyaltyCostCents: number; // Cost of free loyalty reward items
-  grossProfitCents: number; // totalCents - totalCmvCents
+  grossProfitCents: number; // totalCents - totalCmvCents (before fees and operational expenses)
+  cardFeeCents?: number; // Acquirer fee when paid by card
+  netSettlementCents?: number; // totalCents - cardFeeCents
   paymentMethod: string;
   accountId: string;
   paymentReceivedImmediately: boolean;
+  paymentStatus?: SalePaymentStatus;
+  approvedByAdminName?: string;
   status: SaleStatus;
   refundReason?: string;
   refundReturnedToStock?: boolean;
@@ -343,12 +374,16 @@ export interface AccountReceivable {
   customerId?: string;
   customerName?: string;
   description: string;
-  totalAmountCents: number;
+  totalAmountCents: number; // Gross sale amount or net receivable
+  grossSaleAmountCents?: number;
+  cardFeeCents?: number;
   receivedAmountCents: number;
   remainingAmountCents: number;
   dueDate: string;
   status: PayableReceivableStatus;
   originSaleId?: string;
+  receivableKind?: 'pix_pending' | 'card_settlement' | 'customer_credit';
+  targetAccountId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -431,5 +466,6 @@ export interface BusinessDatabaseState {
   customers: Customer[];
   goals: CommercialGoal[];
   auditLogs: AuditLog[];
+  shiftClosings?: ShiftClosingRecord[];
   idempotencyKeys: Record<string, string>; // key -> entityId
 }

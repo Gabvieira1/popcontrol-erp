@@ -24,7 +24,7 @@ import { InventoryLot } from '../types/domain';
 import { BarcodeScannerModal, BarcodeOperationMode } from '../components/BarcodeScannerModal';
 
 export const InventoryModule: React.FC = () => {
-  const { db, adjustStockLot, reconcilePhysicalInventory, clearAllInventory, notify, setActiveModule } = useERP();
+  const { db, activeRole, adjustStockLot, reconcilePhysicalInventory, clearAllInventory, notify, setActiveModule } = useERP();
   const [selectedTab, setSelectedTab] = useState<'lots' | 'movements' | 'audit'>('lots');
 
   // Manual Lot Movement Modal
@@ -34,6 +34,7 @@ export const InventoryModule: React.FC = () => {
   >('loss');
   const [adjQty, setAdjQty] = useState(1);
   const [adjReason, setAdjReason] = useState('');
+  const [adjAdminPin, setAdjAdminPin] = useState('');
 
   // Physical Inventory Count State
   const [auditLotId, setAuditLotId] = useState<string>('');
@@ -63,9 +64,12 @@ export const InventoryModule: React.FC = () => {
         type: adjType,
         quantity: adjQty,
         reason: adjReason,
+        adminApprovalPin: adjAdminPin || undefined,
+        actingRole: activeRole,
       });
       setAdjustingLot(null);
       setAdjReason('');
+      setAdjAdminPin('');
       setAdjQty(1);
     } catch (err) {
       notify(
@@ -553,6 +557,21 @@ export const InventoryModule: React.FC = () => {
                   className="w-full px-3 py-2 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
                 />
               </div>
+              {activeRole === 'operator' && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 space-y-1.5">
+                  <label className="block font-bold text-[#DC2626]">
+                    Aprovação do Administrador Obrigatória (PIN) *
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={adjAdminPin}
+                    onChange={(e) => setAdjAdminPin(e.target.value)}
+                    placeholder="PIN do Administrador (Padrão: 1234)"
+                    className="w-full px-3 py-1.5 rounded border border-red-300 dark:border-red-700 bg-white dark:bg-zinc-900 font-mono"
+                  />
+                </div>
+              )}
               <div className="flex justify-end gap-2 pt-3">
                 <button
                   type="button"

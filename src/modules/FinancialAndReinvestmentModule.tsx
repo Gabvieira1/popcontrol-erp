@@ -12,6 +12,8 @@ import {
   Sliders,
   Play,
   ShieldCheck,
+  AlertTriangle,
+  ClipboardCheck,
 } from 'lucide-react';
 import { useERP } from '../context/ERPContext';
 import {
@@ -32,13 +34,23 @@ export const FinancialModule: React.FC = () => {
     transferBetweenAccounts,
     settlePayable,
     settleReceivable,
+    closeShift,
     createAccount,
     createManualPayable,
     createManualReceivable,
     notify,
   } = useERP();
 
-  const [tab, setTab] = useState<'cashflow' | 'dre' | 'payables' | 'accounts'>('cashflow');
+  const [tab, setTab] = useState<'cashflow' | 'dre' | 'payables' | 'accounts' | 'shift'>('cashflow');
+
+  // DRE Date Range Cut-off Filter (Escopo de produção: corte de datas na DRE)
+  const [dreStartDate, setDreStartDate] = useState('');
+  const [dreEndDate, setDreEndDate] = useState('');
+
+  // Shift Closing State (Item 4: Fechamento por turno)
+  const [countedPhysicalCashInput, setCountedPhysicalCashInput] = useState('');
+  const [confirmedPixInput, setConfirmedPixInput] = useState('');
+  const [shiftNotes, setShiftNotes] = useState('');
 
   // New Financial Entry Modal
   const [showEntryModal, setShowEntryModal] = useState(false);
@@ -89,6 +101,15 @@ export const FinancialModule: React.FC = () => {
 
   if (!db) return null;
   const snapshot = calculateFinancialSnapshot(db);
+  const dreSnapshot = calculateFinancialSnapshot(
+    db,
+    dreStartDate || dreEndDate
+      ? { startDate: dreStartDate || undefined, endDate: dreEndDate || undefined }
+      : undefined
+  );
+  const hasNegativeAccount = Object.values(snapshot.accountBalances).some(
+    (bal) => bal < 0
+  );
 
   const handleSaveEntry = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -170,11 +191,37 @@ export const FinancialModule: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Negative Cash Balance Warning Banner (Item 4) */}
+      {(snapshot.cashBalanceCents < 0 || hasNegativeAccount) && (
+        <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/50 border-2 border-[#DC2626] text-[#DC2626] dark:text-red-200 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+          <div className="text-xs">
+            <strong className="block text-sm">
+              Sinalização de Saldo Negativo em Caixa!
+            </strong>
+            <span>
+              Existe conta financeira operando com saldo negativo (Saldo Consolidado:{' '}
+              <strong>{formatCentsToBRL(snapshot.cashBalanceCents)}</strong>). Verifique a conferência de caixa, realize uma transferência entre contas ou registre um aporte de capital.
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Top Financial Indicators (Section 11) */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        <div className="p-4 rounded-xl bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800">
+        <div
+          className={`p-4 rounded-xl bg-white dark:bg-zinc-900 border ${
+            snapshot.cashBalanceCents < 0
+              ? 'border-[#DC2626] bg-red-50/30 dark:bg-red-950/20'
+              : 'border-[#E4E4E7] dark:border-zinc-800'
+          }`}
+        >
           <span className="text-[11px] text-[#71717A] block">Saldo em Caixa</span>
-          <strong className="font-mono text-base text-[#16A34A]">
+          <strong
+            className={`font-mono text-base ${
+              snapshot.cashBalanceCents < 0 ? 'text-[#DC2626]' : 'text-[#16A34A]'
+            }`}
+          >
             {formatCentsToBRL(snapshot.cashBalanceCents)}
           </strong>
         </div>
@@ -260,6 +307,26 @@ export const FinancialModule: React.FC = () => {
           >
             <ArrowLeftRight className="w-4 h-4" />
             Contas Financeiras ({db.accounts.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setTab('shift');
+              setCountedPhysicalCashInput(
+                formatCentsToDecimal(snapshot.accountBalances['acc_cash'] ?? 0)
+              );
+              setConfirmedPixInput(
+                formatCentsToDecimal(snapshot.accountBalances['acc_pix'] ?? 0)
+              );
+            }}
+            className={`px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 ${
+              tab === 'shift'
+                ? 'bg-[#18181B] text-white dark:bg-[#F6C344] dark:text-[#18181B]'
+                : 'bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 text-[#71717A]'
+            }`}
+          >
+            <ClipboardCheck className="w-4 h-4" />
+            Conferência & Fechamento de Turno
           </button>
         </div>
 
@@ -365,8 +432,8 @@ export const FinancialModule: React.FC = () => {
       )}
 
       {tab === 'dre' && (
-        <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-6 max-w-2xl">
-          <div className="pb-4 border-b border-[#E4E4E7] dark:border-zinc-800 flex items-start justify-between">
+        <div className="bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-6 max-w-2xl space-y-4">
+          <div className="pb-4 border-b border-[#E4E4E7] dark:border-zinc-800 flex flex-col sm:flex-row sm:items-start justify-between gap-3">
             <div>
               <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-[#F6C344]/20 text-[#A16207] dark:text-[#F6C344] mb-1">
                 Demonstrativo de Resultado do Exercício — DRE Gerencial
@@ -375,57 +442,72 @@ export const FinancialModule: React.FC = () => {
                 DRE Gerencial — {db.settings.businessName}
               </h3>
               <p className="text-xs text-[#71717A] mt-0.5">
-                Aviso legal: Este relatório é um demonstrativo exclusivamente gerencial para tomada de decisão, e não substitui a escrituração contábil oficial.
+                Aviso legal: Demonstrativo gerencial para tomada de decisão, com suporte a corte por período.
               </p>
+            </div>
+            <div className="flex items-center gap-1.5 text-xs">
+              <input
+                type="date"
+                value={dreStartDate}
+                onChange={(e) => setDreStartDate(e.target.value)}
+                className="px-2 py-1 rounded border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800 font-mono"
+              />
+              <span>a</span>
+              <input
+                type="date"
+                value={dreEndDate}
+                onChange={(e) => setDreEndDate(e.target.value)}
+                className="px-2 py-1 rounded border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800 font-mono"
+              />
             </div>
           </div>
 
-          <div className="divide-y divide-[#E4E4E7] dark:divide-zinc-800 text-xs font-mono mt-4">
+          <div className="divide-y divide-[#E4E4E7] dark:divide-zinc-800 text-xs font-mono">
             <div className="py-2.5 flex justify-between">
               <span className="font-sans font-medium">1. Receita Bruta de Vendas</span>
-              <strong>{formatCentsToBRL(snapshot.grossRevenueCents)}</strong>
+              <strong>{formatCentsToBRL(dreSnapshot.grossRevenueCents)}</strong>
             </div>
             <div className="py-2.5 flex justify-between text-[#DC2626]">
               <span className="font-sans">2. (-) Descontos Concedidos e Devoluções</span>
-              <span>-{formatCentsToBRL(snapshot.totalDiscountsCents)}</span>
+              <span>-{formatCentsToBRL(dreSnapshot.totalDiscountsCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between text-[#DC2626]">
               <span className="font-sans">3. (-) Impostos Incidentes sobre Vendas</span>
-              <span>-{formatCentsToBRL(snapshot.salesTaxesInPeriodCents)}</span>
+              <span>-{formatCentsToBRL(dreSnapshot.salesTaxesInPeriodCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between bg-[#F7F8FA] dark:bg-zinc-800/60 px-2 rounded font-bold">
               <span className="font-sans">4. (=) Receita Líquida de Vendas</span>
-              <span>{formatCentsToBRL(snapshot.netSalesRevenueCents)}</span>
+              <span>{formatCentsToBRL(dreSnapshot.netSalesRevenueCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between text-[#DC2626]">
               <span className="font-sans">
                 5. (-) Custo das Mercadorias Vendidas — CMV (Histórico FEFO)
               </span>
-              <span>-{formatCentsToBRL(snapshot.cmvCents)}</span>
+              <span>-{formatCentsToBRL(dreSnapshot.cmvCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between bg-emerald-50/70 dark:bg-emerald-950/30 px-2 rounded font-bold text-[#16A34A]">
               <span className="font-sans">
-                6. (=) Lucro Bruto (Margem Bruta: {formatPercent(snapshot.grossMarginPercent)})
+                6. (=) Lucro Bruto (Margem Bruta: {formatPercent(dreSnapshot.grossMarginPercent)})
               </span>
-              <span>{formatCentsToBRL(snapshot.grossProfitCents)}</span>
+              <span>{formatCentsToBRL(dreSnapshot.grossProfitCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between text-[#DC2626]">
-              <span className="font-sans">7. (-) Despesas Operacionais</span>
-              <span>-{formatCentsToBRL(snapshot.operationalExpensesCents)}</span>
+              <span className="font-sans">7. (-) Despesas Operacionais e Taxas de Cartão</span>
+              <span>-{formatCentsToBRL(dreSnapshot.operationalExpensesCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between text-[#DC2626]">
               <span className="font-sans">8. (-) Perdas e Avarias de Estoque</span>
-              <span>-{formatCentsToBRL(snapshot.inventoryLossesCents)}</span>
+              <span>-{formatCentsToBRL(dreSnapshot.inventoryLossesCents)}</span>
             </div>
             <div className="py-2.5 flex justify-between text-[#16A34A]">
               <span className="font-sans">9. (+) Outras Receitas Operacionais</span>
-              <span>+{formatCentsToBRL(snapshot.otherOperationalIncomeCents)}</span>
+              <span>+{formatCentsToBRL(dreSnapshot.otherOperationalIncomeCents)}</span>
             </div>
             <div className="py-3.5 flex justify-between bg-[#18181B] text-white dark:bg-[#F6C344] dark:text-[#18181B] px-3 rounded-lg font-bold text-sm mt-2">
               <span className="font-sans">
-                10. (=) Resultado Líquido Gerencial ({formatPercent(snapshot.netMarginPercent)})
+                10. (=) Resultado Líquido Gerencial ({formatPercent(dreSnapshot.netMarginPercent)})
               </span>
-              <span>{formatCentsToBRL(snapshot.netProfitCents)}</span>
+              <span>{formatCentsToBRL(dreSnapshot.netProfitCents)}</span>
             </div>
           </div>
         </div>
@@ -605,7 +687,11 @@ export const FinancialModule: React.FC = () => {
                   </div>
                   <div className="mt-4 pt-3 border-t border-[#E4E4E7] dark:border-zinc-800 flex items-baseline justify-between">
                     <span className="text-xs text-[#71717A]">Saldo Atual:</span>
-                    <strong className="font-mono text-lg text-[#16A34A]">
+                    <strong
+                      className={`font-mono text-lg ${
+                        bal < 0 ? 'text-[#DC2626]' : 'text-[#16A34A]'
+                      }`}
+                    >
                       {formatCentsToBRL(bal)}
                     </strong>
                   </div>
@@ -674,6 +760,201 @@ export const FinancialModule: React.FC = () => {
                 Adicionar Conta
               </button>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Item 4: Shift Closing & Cash Conference Tab (Fechamento por Turno) */}
+      {tab === 'shift' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="lg:col-span-6 bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-5 space-y-4">
+            <div>
+              <h3 className="text-sm font-bold">
+                Fechamento de Caixa por Turno & Conferência Física
+              </h3>
+              <p className="text-xs text-[#71717A]">
+                Compare o dinheiro físico contado na gaveta, o Pix efetivamente recebido na conta, o Pix pendente e os valores de Cartão a liquidar.
+              </p>
+            </div>
+
+            {(() => {
+              const expectedCashCents = snapshot.accountBalances['acc_cash'] ?? 0;
+              const countedCashCents = parseReaisToCents(countedPhysicalCashInput);
+              const cashDiffCents = countedCashCents - expectedCashCents;
+              const expectedPixCents = snapshot.accountBalances['acc_pix'] ?? 0;
+              const confirmedPixCents = parseReaisToCents(confirmedPixInput);
+
+              return (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    await closeShift({
+                      countedPhysicalCashCents: countedCashCents,
+                      confirmedPixReceivedCents: confirmedPixCents,
+                      notes: shiftNotes.trim() || undefined,
+                    });
+                    setShiftNotes('');
+                  }}
+                  className="space-y-4 text-xs"
+                >
+                  <div className="grid grid-cols-2 gap-3 p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800/70 border border-[#E4E4E7] dark:border-zinc-700">
+                    <div>
+                      <span className="text-[#71717A] text-[10px] block">
+                        1. Dinheiro Esperado (Sistema)
+                      </span>
+                      <strong className="font-mono text-sm">
+                        {formatCentsToBRL(expectedCashCents)}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-[#71717A] text-[10px] block">
+                        Diferença no Dinheiro Físico
+                      </span>
+                      <strong
+                        className={`font-mono text-sm ${
+                          cashDiffCents === 0
+                            ? 'text-[#16A34A]'
+                            : cashDiffCents > 0
+                            ? 'text-blue-600'
+                            : 'text-[#DC2626]'
+                        }`}
+                      >
+                        {cashDiffCents > 0 ? '+' : ''}
+                        {formatCentsToBRL(cashDiffCents)} (
+                        {cashDiffCents === 0
+                          ? 'Bateu Exato'
+                          : cashDiffCents > 0
+                          ? 'Sobra'
+                          : 'Quebra de Caixa'}
+                        )
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-[#71717A] text-[10px] block">
+                        2. Pix Recebido no Caixa
+                      </span>
+                      <strong className="font-mono text-sm text-[#16A34A]">
+                        {formatCentsToBRL(expectedPixCents)}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-[#71717A] text-[10px] block">
+                        3. Pix Pendente de Confirmação
+                      </span>
+                      <strong className="font-mono text-sm text-[#A16207]">
+                        {formatCentsToBRL(snapshot.pendingPixCents)}
+                      </strong>
+                    </div>
+                    <div className="col-span-2 pt-2 border-t border-[#E4E4E7] dark:border-zinc-700 flex justify-between items-center">
+                      <span className="text-[#71717A]">
+                        4. Cartão a Liquidar (Líquido em Contas a Receber):
+                      </span>
+                      <strong className="font-mono text-sm text-blue-600 dark:text-blue-400">
+                        {formatCentsToBRL(snapshot.pendingCardSettlementCents)}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-medium mb-1">
+                        Dinheiro Contado na Gaveta (R$) *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={countedPhysicalCashInput}
+                        onChange={(e) => setCountedPhysicalCashInput(e.target.value)}
+                        className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-medium mb-1">
+                        Pix Conferido no Extrato (R$) *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={confirmedPixInput}
+                        onChange={(e) => setConfirmedPixInput(e.target.value)}
+                        className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-medium mb-1">
+                      Observações do Fechamento de Turno
+                    </label>
+                    <input
+                      type="text"
+                      value={shiftNotes}
+                      onChange={(e) => setShiftNotes(e.target.value)}
+                      placeholder="Ex.: Turno da tarde conferido sem divergências"
+                      className="w-full px-3 py-2 rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full py-2.5 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] font-bold"
+                  >
+                    Registrar Fechamento de Turno Auditável
+                  </button>
+                </form>
+              );
+            })()}
+          </div>
+
+          <div className="lg:col-span-6 bg-white dark:bg-zinc-900 border border-[#E4E4E7] dark:border-zinc-800 rounded-xl p-5 space-y-4">
+            <h3 className="text-sm font-bold">
+              Histórico de Fechamentos de Turno ({db.shiftClosings?.length || 0})
+            </h3>
+            {!db.shiftClosings || db.shiftClosings.length === 0 ? (
+              <p className="text-xs text-[#71717A] py-6 text-center">
+                Nenhum turno fechado ainda. Realize a conferência ao lado para registrar o primeiro fechamento.
+              </p>
+            ) : (
+              <div className="space-y-2.5 max-h-96 overflow-y-auto">
+                {db.shiftClosings.map((sc) => (
+                  <div
+                    key={sc.id}
+                    className="p-3.5 rounded-xl bg-[#F7F8FA] dark:bg-zinc-800/70 border border-[#E4E4E7] dark:border-zinc-700 text-xs space-y-1.5"
+                  >
+                    <div className="flex justify-between font-bold">
+                      <span>{new Date(sc.closedAt).toLocaleString('pt-BR')}</span>
+                      <span>Resp: {sc.closedByUserName}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 font-mono text-[11px] pt-1">
+                      <div>
+                        Dinheiro Contado: <strong>{formatCentsToBRL(sc.countedPhysicalCashCents)}</strong> (Dif:{' '}
+                        <span
+                          className={
+                            sc.cashDifferenceCents < 0 ? 'text-[#DC2626]' : 'text-[#16A34A]'
+                          }
+                        >
+                          {formatCentsToBRL(sc.cashDifferenceCents)}
+                        </span>
+                        )
+                      </div>
+                      <div>
+                        Pix Confirmado: <strong>{formatCentsToBRL(sc.confirmedPixReceivedCents)}</strong>
+                      </div>
+                      <div>
+                        Pix Pendente: <strong>{formatCentsToBRL(sc.pixPendingCents)}</strong>
+                      </div>
+                      <div>
+                        Cartão a Liquidar:{' '}
+                        <strong>{formatCentsToBRL(sc.cardToSettleReceivablesCents)}</strong>
+                      </div>
+                    </div>
+                    {sc.notes && (
+                      <p className="text-[11px] text-[#71717A] italic">{sc.notes}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

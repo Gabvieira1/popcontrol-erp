@@ -25,8 +25,10 @@ import {
   Supplier,
   Customer,
   CommercialGoal,
+  ShiftClosingRecord,
+  Role,
 } from '../types/domain';
-import { allocateLotsFEFO, getProductInventorySummary } from './accounting';
+import { allocateLotsFEFO, getProductInventorySummary, calculateFinancialSnapshot } from './accounting';
 
 function cloneState(state: BusinessDatabaseState): BusinessDatabaseState {
   return JSON.parse(JSON.stringify(state));
@@ -36,6 +38,25 @@ function generateId(prefix: string): string {
   const rand = Math.random().toString(36).substring(2, 9);
   const time = Date.now().toString(36);
   return `${prefix}_${time}_${rand}`;
+}
+
+function verifyAdminOrApproval(
+  state: BusinessDatabaseState,
+  actionLabel: string,
+  adminApprovalPin?: string,
+  actingRole?: Role
+): string | undefined {
+  const role = actingRole || state.profile.role || 'admin';
+  if (role === 'admin') {
+    return state.profile.displayName || 'Administrador';
+  }
+  const expectedPin = state.settings.permissionsConfig?.adminPinCode || '1234';
+  if (!adminApprovalPin || adminApprovalPin.trim() !== expectedPin) {
+    throw new Error(
+      `Permissão negada para Operador de Caixa: "${actionLabel}" exige senha/PIN de aprovação do Administrador.`
+    );
+  }
+  return 'Aprovado por PIN Administrador';
 }
 
 function appendAuditLog(
@@ -267,6 +288,7 @@ export function executeCreatePurchase(
     throw new Error('O valor total da compra após desconto não pode ser negativo.');
   }
 
+  // Exact integer cents rounding with remainder awareness
   const effectiveUnitCostCents = Math.round(totalCostCents / totalUnits);
   const purchaseId = generateId('pur');
 
@@ -573,6 +595,11 @@ export interface CreateSalePayload {
   paymentMethod: string;
   accountId: string;
   paymentReceivedImmediately?: boolean;
+  isPixPending?: boolean;
+  isCardToSettle?: boolean;
+  cardFeePercentOverride?: number;
+  adminApprovalPin?: string;
+  actingRole?: Role;
   dueDate?: string;
   notes?: string;
   salesChannel?: string;
@@ -582,16 +609,28 @@ export interface CreateSalePayload {
 export function executePosSale(
   currentState: BusinessDatabaseState,
   payload: CreateSalePayload
-): { state: BusinessDatabaseState; sale: Sale } {
+): { state: BusinessDatabaseState; sale: Sale; duplicateIdempotentHit?: boolean } {
   const state = cloneState(currentState);
   const now = payload.nowISO || new Date().toISOString();
 
   if (!payload.idempotencyKey) {
     throw new Error('Chave de idempotência obrigatória para registrar venda.');
   }
-  if (state.idempotencyKeys[payload.idempotencyKey]) {
+
+  // Idempotent retry behavior: if the exact same sale is resubmitted, return the existing single record!
+  const existingSaleId = state.idempotencyKeys[payload.idempotencyKey];
+  if (existingSaleId) {
+    const existingSale = state.sales.find((s) => s.id === existingSaleId);
+    if (existingSale) {
+      return {
+        state,
+        sale: existingSale,
+        duplicateIdempotentHit: true,
+      };
+    }
     throw new Error('Venda já processada (proteção contra clique duplicado).');
   }
+
   if (!payload.items || payload.items.length === 0) {
     throw new Error('O carrinho de vendas está vazio.');
   }
@@ -722,6 +761,22 @@ export function executePosSale(
   const totalCents = subtotalCents - totalDiscountCents;
   const grossProfitCents = totalCents - totalCmvCents;
 
+  // Check operator discount limit and require admin approval when above threshold
+  const discountPercent =
+    subtotalCents > 0 ? (totalDiscountCents / subtotalCents) * 100 : 0;
+  const maxOperatorDiscountPct =
+    state.settings.permissionsConfig?.operatorMaxDiscountPercent ?? 10;
+  let approvedByAdminName: string | undefined;
+
+  if (discountPercent > maxOperatorDiscountPct) {
+    approvedByAdminName = verifyAdminOrApproval(
+      state,
+      `Desconto de ${discountPercent.toFixed(1)}% acima do limite de ${maxOperatorDiscountPct}%`,
+      payload.adminApprovalPin,
+      payload.actingRole
+    );
+  }
+
   // Optional customer update (CRM & Loyalty)
   let customerName: string | undefined;
   if (payload.customerId) {
@@ -761,7 +816,42 @@ export function executePosSale(
     }
   }
 
-  const paymentReceivedImmediately = payload.paymentReceivedImmediately !== false;
+  const isCardMethod =
+    payload.paymentMethod === 'Cartão de débito' ||
+    payload.paymentMethod === 'Cartão de crédito';
+  const isCardToSettle =
+    payload.isCardToSettle !== undefined ? payload.isCardToSettle : isCardMethod;
+  const isPixPending = Boolean(
+    payload.paymentMethod === 'Pix' && payload.isPixPending
+  );
+
+  // Determine card acquirer fee if paid by card
+  let cardFeeCents = 0;
+  if (isCardMethod && totalCents > 0) {
+    const defaultFeePct =
+      payload.paymentMethod === 'Cartão de débito'
+        ? (state.settings.permissionsConfig?.debitCardFeePercent ?? 1.99)
+        : (state.settings.permissionsConfig?.creditCardFeePercent ?? 3.99);
+    const feePct =
+      payload.cardFeePercentOverride !== undefined
+        ? payload.cardFeePercentOverride
+        : defaultFeePct;
+    cardFeeCents = Math.round(totalCents * (feePct / 100));
+  }
+  const netSettlementCents = Math.max(0, totalCents - cardFeeCents);
+
+  const paymentReceivedImmediately =
+    !isPixPending &&
+    !isCardToSettle &&
+    payload.paymentReceivedImmediately !== false;
+
+  const paymentStatus = isPixPending
+    ? 'pending_pix'
+    : isCardToSettle
+    ? 'pending_card_settlement'
+    : paymentReceivedImmediately
+    ? 'received'
+    : 'pending_receivable';
 
   const sale: Sale = {
     id: saleId,
@@ -780,9 +870,13 @@ export function executePosSale(
     totalCmvCents,
     promotionalLoyaltyCostCents,
     grossProfitCents,
+    cardFeeCents,
+    netSettlementCents,
     paymentMethod: payload.paymentMethod,
     accountId: payload.accountId || 'acc_pix',
     paymentReceivedImmediately,
+    paymentStatus,
+    approvedByAdminName,
     status: 'completed',
     notes: payload.notes,
     salesChannel: payload.salesChannel || 'Venda Presencial',
@@ -794,7 +888,7 @@ export function executePosSale(
   state.sales.unshift(sale);
   state.idempotencyKeys[payload.idempotencyKey] = saleId;
 
-  // Step 7 & 8: Financial inflow or Account Receivable
+  // Step 7 & 8: Financial inflow or Account Receivable (Pix Pendente / Cartão a Liquidar)
   if (totalCents > 0) {
     if (paymentReceivedImmediately) {
       const tx: FinancialTransaction = {
@@ -813,19 +907,51 @@ export function executePosSale(
         createdAt: now,
       };
       state.financialTransactions.unshift(tx);
+
+      if (cardFeeCents > 0) {
+        state.financialTransactions.unshift({
+          id: generateId('tx'),
+          businessId: state.profile.businessId,
+          type: 'payment_fee',
+          direction: 'out',
+          categoryId: 'cat_bank_fees',
+          categoryName: 'Taxas bancárias',
+          accountId: sale.accountId,
+          amountCents: cardFeeCents,
+          description: `Taxa de maquininha Venda ${saleCode} (${sale.paymentMethod})`,
+          referenceDocumentId: sale.id,
+          occurredAt: now,
+          createdByUserId: state.profile.uid,
+          createdAt: now,
+        });
+      }
     } else {
+      const recKind = isPixPending
+        ? 'pix_pending'
+        : isCardToSettle
+        ? 'card_settlement'
+        : 'customer_credit';
+      const recAmountCents = isCardToSettle ? netSettlementCents : totalCents;
       const receivable: AccountReceivable = {
         id: generateId('rec'),
         businessId: state.profile.businessId,
         customerId: sale.customerId,
-        customerName: sale.customerName || 'Cliente não identificado',
-        description: `Venda a prazo ${saleCode}`,
-        totalAmountCents: totalCents,
+        customerName: sale.customerName || 'Consumidor Final',
+        description: isPixPending
+          ? `Pix Pendente de Confirmação — Venda ${saleCode}`
+          : isCardToSettle
+          ? `Cartão a Liquidar (${sale.paymentMethod}) — Venda ${saleCode}`
+          : `Venda a prazo ${saleCode}`,
+        totalAmountCents: recAmountCents,
+        grossSaleAmountCents: totalCents,
+        cardFeeCents,
         receivedAmountCents: 0,
-        remainingAmountCents: totalCents,
+        remainingAmountCents: recAmountCents,
         dueDate: payload.dueDate || now.slice(0, 10),
         status: 'pending',
         originSaleId: sale.id,
+        receivableKind: recKind,
+        targetAccountId: sale.accountId,
         createdAt: now,
         updatedAt: now,
       };
@@ -857,6 +983,8 @@ export interface RefundSalePayload {
   mode: 'refunded' | 'cancelled';
   returnToSellableStock: boolean;
   reason: string;
+  adminApprovalPin?: string;
+  actingRole?: Role;
   nowISO?: string;
 }
 
@@ -866,6 +994,13 @@ export function executeRefundOrCancelSale(
 ): BusinessDatabaseState {
   const state = cloneState(currentState);
   const now = payload.nowISO || new Date().toISOString();
+
+  verifyAdminOrApproval(
+    state,
+    'Estorno ou Cancelamento de Venda',
+    payload.adminApprovalPin,
+    payload.actingRole
+  );
 
   if (!payload.reason || !payload.reason.trim()) {
     throw new Error('É obrigatório informar o motivo do estorno ou cancelamento.');
@@ -1007,6 +1142,8 @@ export interface ManualStockAdjustmentPayload {
   type: 'loss' | 'damage' | 'expiration' | 'positive_adjustment' | 'negative_adjustment';
   quantity: number;
   reason: string;
+  adminApprovalPin?: string;
+  actingRole?: Role;
   nowISO?: string;
 }
 
@@ -1016,6 +1153,13 @@ export function executeStockLotAdjustment(
 ): BusinessDatabaseState {
   const state = cloneState(currentState);
   const now = payload.nowISO || new Date().toISOString();
+
+  verifyAdminOrApproval(
+    state,
+    'Ajuste / Baixa de Estoque',
+    payload.adminApprovalPin,
+    payload.actingRole
+  );
 
   if (payload.quantity <= 0 || !Number.isInteger(payload.quantity)) {
     throw new Error('A quantidade movimentada deve ser um número inteiro maior que zero.');
@@ -1334,24 +1478,158 @@ export function executeSettleReceivable(
   rec.status = rec.remainingAmountCents === 0 ? 'paid' : 'pending';
   rec.updatedAt = now;
 
-  const tx: FinancialTransaction = {
-    id: generateId('tx'),
-    businessId: state.profile.businessId,
-    type: 'sale_receipt',
-    direction: 'in',
-    categoryId: 'cat_sales',
-    categoryName: 'Receita de vendas',
-    accountId: payload.accountId,
-    amountCents: payload.receivedAmountCents,
-    description: `Recebimento de Conta a Receber: ${rec.description}`,
-    referenceDocumentId: rec.id,
-    occurredAt: now,
-    createdByUserId: state.profile.uid,
-    createdAt: now,
-  };
-  state.financialTransactions.unshift(tx);
+  // If linked to a sale (e.g. Pix Pendente or Cartão a Liquidar), mark sale paymentStatus as received when fully settled
+  if (rec.originSaleId && rec.remainingAmountCents === 0) {
+    const originSale = state.sales.find((s) => s.id === rec.originSaleId);
+    if (originSale) {
+      originSale.paymentStatus = 'received';
+      originSale.paymentReceivedImmediately = true;
+    }
+  }
+
+  // If settling a card receivable that had an acquirer fee, record the full gross sale inflow and the fee outflow so DRE recognizes the card fee expense accurately
+  if (
+    rec.receivableKind === 'card_settlement' &&
+    rec.cardFeeCents &&
+    rec.cardFeeCents > 0 &&
+    rec.remainingAmountCents === 0
+  ) {
+    const grossInflow = payload.receivedAmountCents + rec.cardFeeCents;
+    state.financialTransactions.unshift({
+      id: generateId('tx'),
+      businessId: state.profile.businessId,
+      type: 'sale_receipt',
+      direction: 'in',
+      categoryId: 'cat_sales',
+      categoryName: 'Receita de vendas',
+      accountId: payload.accountId,
+      amountCents: grossInflow,
+      description: `Liquidação Bruta Cartão: ${rec.description}`,
+      referenceDocumentId: rec.id,
+      occurredAt: now,
+      createdByUserId: state.profile.uid,
+      createdAt: now,
+    });
+    state.financialTransactions.unshift({
+      id: generateId('tx'),
+      businessId: state.profile.businessId,
+      type: 'payment_fee',
+      direction: 'out',
+      categoryId: 'cat_bank_fees',
+      categoryName: 'Taxas bancárias',
+      accountId: payload.accountId,
+      amountCents: rec.cardFeeCents,
+      description: `Taxa de Liquidação de Cartão: ${rec.description}`,
+      referenceDocumentId: rec.id,
+      occurredAt: now,
+      createdByUserId: state.profile.uid,
+      createdAt: now,
+    });
+  } else {
+    const tx: FinancialTransaction = {
+      id: generateId('tx'),
+      businessId: state.profile.businessId,
+      type: 'sale_receipt',
+      direction: 'in',
+      categoryId: 'cat_sales',
+      categoryName: 'Receita de vendas',
+      accountId: payload.accountId,
+      amountCents: payload.receivedAmountCents,
+      description: `Recebimento de Conta a Receber: ${rec.description}`,
+      referenceDocumentId: rec.id,
+      occurredAt: now,
+      createdByUserId: state.profile.uid,
+      createdAt: now,
+    };
+    state.financialTransactions.unshift(tx);
+  }
 
   return state;
+}
+
+/**
+ * Confirm Pending Pix on a Sale directly
+ */
+export function executeConfirmPendingPixSale(
+  currentState: BusinessDatabaseState,
+  payload: {
+    saleId: string;
+    accountId?: string;
+    nowISO?: string;
+  }
+): BusinessDatabaseState {
+  const rec = currentState.receivables.find(
+    (r) =>
+      r.originSaleId === payload.saleId &&
+      r.status !== 'paid' &&
+      r.status !== 'cancelled'
+  );
+  if (!rec) {
+    throw new Error('Não há Pix pendente para esta venda.');
+  }
+  const sale = currentState.sales.find((s) => s.id === payload.saleId);
+  return executeSettleReceivable(currentState, {
+    receivableId: rec.id,
+    receivedAmountCents: rec.remainingAmountCents,
+    accountId: payload.accountId || sale?.accountId || 'acc_pix',
+    nowISO: payload.nowISO,
+  });
+}
+
+/**
+ * Shift Closing (Fechamento de Caixa por Turno) — Item 4
+ * Compares physical cash counted, Pix received vs pending, and Card to settle.
+ */
+export function executeCloseShift(
+  currentState: BusinessDatabaseState,
+  payload: {
+    countedPhysicalCashCents: number;
+    confirmedPixReceivedCents: number;
+    notes?: string;
+    nowISO?: string;
+  }
+): { state: BusinessDatabaseState; closing: ShiftClosingRecord } {
+  const state = cloneState(currentState);
+  const now = payload.nowISO || new Date().toISOString();
+  const snap = calculateFinancialSnapshot(state, undefined, now);
+
+  const expectedPhysicalCashCents = snap.accountBalances['acc_cash'] ?? 0;
+  const expectedPixReceivedCents = snap.accountBalances['acc_pix'] ?? 0;
+  const cashDifferenceCents =
+    payload.countedPhysicalCashCents - expectedPhysicalCashCents;
+
+  const closing: ShiftClosingRecord = {
+    id: generateId('shift'),
+    businessId: state.profile.businessId,
+    openedAt: state.shiftClosings?.[0]?.closedAt || state.profile.createdAt,
+    closedAt: now,
+    closedByUserId: state.profile.uid,
+    closedByUserName: state.profile.displayName || state.profile.email,
+    expectedPhysicalCashCents,
+    countedPhysicalCashCents: payload.countedPhysicalCashCents,
+    cashDifferenceCents,
+    expectedPixReceivedCents,
+    confirmedPixReceivedCents: payload.confirmedPixReceivedCents,
+    pixPendingCents: snap.pendingPixCents,
+    cardToSettleReceivablesCents: snap.pendingCardSettlementCents,
+    notes: payload.notes,
+  };
+
+  if (!state.shiftClosings) {
+    state.shiftClosings = [];
+  }
+  state.shiftClosings.unshift(closing);
+
+  appendAuditLog(
+    state,
+    'SHIFT_CLOSED',
+    'shiftClosing',
+    closing.id,
+    `Fechamento de Turno: Dinheiro Contado=${payload.countedPhysicalCashCents} (Dif=${cashDifferenceCents}) | Pix Recebido=${payload.confirmedPixReceivedCents} | Pix Pendente=${snap.pendingPixCents} | Cartão a Liquidar=${snap.pendingCardSettlementCents}`,
+    now
+  );
+
+  return { state, closing };
 }
 
 /**

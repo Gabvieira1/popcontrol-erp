@@ -68,14 +68,34 @@ service cloud.firestore {
 
       allow delete: if false;
 
-      // Members subcollection: Only admin can manage members, no self-elevation
+      // Members subcollection: Strict single-owner bootstrap & admin-only member management
+      // Prevents unauthorized users from self-joining an existing business or escalating from operator to admin
       match /members/{memberUid} {
         allow read: if isBusinessMember(businessId) || isOwnerUser(memberUid);
-        allow create: if (isOwnerUser(memberUid) && !exists(/databases/$(database)/documents/businesses/$(businessId)/members/$(memberUid)))
-          || isBusinessAdmin(businessId);
+        allow create: if (
+            // Only the initial business creator can bootstrap their own admin member record when the business is created
+            isOwnerUser(memberUid) &&
+            !exists(/databases/$(database)/documents/businesses/$(businessId)/members/$(memberUid)) &&
+            get(/databases/$(database)/documents/businesses/$(businessId)).data.profile.uid == request.auth.uid &&
+            request.resource.data.uid == request.auth.uid &&
+            request.resource.data.role == 'admin'
+          ) || (
+            // Subsequent members (e.g. operators) can ONLY be added by an existing active Business Admin
+            isBusinessAdmin(businessId) &&
+            request.resource.data.role in ['admin', 'operator']
+          );
         allow update: if isBusinessAdmin(businessId)
           && request.resource.data.uid == resource.data.uid;
         allow delete: if false;
+      }
+
+      // Shift Closings subcollection: Append-only shift closing audit records
+      match /shiftClosings/{closingId} {
+        allow read: if isBusinessMember(businessId);
+        allow create: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && request.resource.data.closedByUserId == request.auth.uid;
+        allow update, delete: if false;
       }
 
       // Products subcollection

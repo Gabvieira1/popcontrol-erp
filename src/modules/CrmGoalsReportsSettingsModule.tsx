@@ -843,7 +843,7 @@ export const ReportsModule: React.FC = () => {
 export const SettingsModule: React.FC<{ onOpenOnboarding: () => void }> = ({
   onOpenOnboarding,
 }) => {
-  const { db, updateSettings, importFullDatabaseJson, notify } = useERP();
+  const { db, activeRole, setActiveRole, updateSettings, importFullDatabaseJson, notify } = useERP();
   const [bizName, setBizName] = useState(db?.settings.businessName || '');
   const [minStock, setMinStock] = useState(db?.settings.defaultMinStock ?? 5);
   const [minReserveInput, setMinReserveInput] = useState(
@@ -852,11 +852,27 @@ export const SettingsModule: React.FC<{ onOpenOnboarding: () => void }> = ({
   const [loyaltyUnits, setLoyaltyUnits] = useState(
     db?.settings.loyaltyRules.paidUnitsRequired ?? 10
   );
+  const [operatorMaxDiscPct, setOperatorMaxDiscPct] = useState(
+    db?.settings.permissionsConfig?.operatorMaxDiscountPercent ?? 10
+  );
+  const [adminPinCode, setAdminPinCode] = useState(
+    db?.settings.permissionsConfig?.adminPinCode ?? '1234'
+  );
+  const [debitFeePct, setDebitFeePct] = useState(
+    db?.settings.permissionsConfig?.debitCardFeePercent ?? 1.99
+  );
+  const [creditFeePct, setCreditFeePct] = useState(
+    db?.settings.permissionsConfig?.creditCardFeePercent ?? 3.99
+  );
 
   if (!db) return null;
 
   const handleSaveGeneral = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (activeRole !== 'admin') {
+      notify('error', 'Acesso restrito', 'Apenas o perfil Administrador pode alterar configurações da empresa.');
+      return;
+    }
     await updateSettings({
       businessName: bizName,
       defaultMinStock: minStock,
@@ -864,6 +880,13 @@ export const SettingsModule: React.FC<{ onOpenOnboarding: () => void }> = ({
       loyaltyRules: {
         ...db.settings.loyaltyRules,
         paidUnitsRequired: loyaltyUnits,
+      },
+      permissionsConfig: {
+        operatorMaxDiscountPercent: operatorMaxDiscPct,
+        adminPinCode: adminPinCode.trim() || '1234',
+        debitCardFeePercent: debitFeePct,
+        creditCardFeePercent: creditFeePct,
+        cardSettlementDays: 1,
       },
     });
   };
@@ -940,13 +963,75 @@ export const SettingsModule: React.FC<{ onOpenOnboarding: () => void }> = ({
                 className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
               />
             </div>
+            <div>
+              <label className="block font-medium mb-1">
+                Limite de Desconto Operador s/ PIN (%)
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={operatorMaxDiscPct}
+                onChange={(e) => setOperatorMaxDiscPct(Number(e.target.value))}
+                className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+              />
+            </div>
+            <div>
+              <label className="block font-medium mb-1">
+                PIN de Aprovação do Administrador (Estornos / Ajustes)
+              </label>
+              <input
+                type="text"
+                value={adminPinCode}
+                onChange={(e) => setAdminPinCode(e.target.value)}
+                className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+              />
+            </div>
+            <div>
+              <label className="block font-medium mb-1">
+                Taxa Cartão de Débito (%)
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                value={debitFeePct}
+                onChange={(e) => setDebitFeePct(Number(e.target.value))}
+                className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+              />
+            </div>
+            <div>
+              <label className="block font-medium mb-1">
+                Taxa Cartão de Crédito (%)
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                value={creditFeePct}
+                onChange={(e) => setCreditFeePct(Number(e.target.value))}
+                className="w-full px-3 py-2 font-mono rounded-lg border border-[#E4E4E7] dark:border-zinc-700 bg-white dark:bg-zinc-800"
+              />
+            </div>
           </div>
-          <button
-            type="submit"
-            className="px-5 py-2 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] font-semibold"
-          >
-            Salvar Configurações
-          </button>
+          <div className="flex items-center justify-between pt-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[#71717A]">Perfil Ativo na Sessão:</span>
+              <button
+                type="button"
+                onClick={() => setActiveRole(activeRole === 'admin' ? 'operator' : 'admin')}
+                className="px-3 py-1 rounded-md border border-[#E4E4E7] dark:border-zinc-700 font-bold"
+              >
+                {activeRole === 'admin' ? 'Administrador (Total)' : 'Operador de Caixa (Restrito)'}
+              </button>
+            </div>
+            <button
+              type="submit"
+              className="px-5 py-2 rounded-lg bg-[#18181B] dark:bg-[#F6C344] text-white dark:text-[#18181B] font-semibold"
+            >
+              Salvar Configurações
+            </button>
+          </div>
         </form>
       </div>
 

@@ -321,6 +321,13 @@ export function createInitialBusinessState(
       lowMarginThresholdPercent: 30,
       payableDueWarningDays: 5,
     },
+    permissionsConfig: {
+      operatorMaxDiscountPercent: 10,
+      adminPinCode: '1234',
+      debitCardFeePercent: 1.99,
+      creditCardFeePercent: 3.99,
+      cardSettlementDays: 1,
+    },
     onboardingCompleted: true,
     initialCapitalConfirmed: false,
     initialPurchaseConfirmed: false,
@@ -371,6 +378,7 @@ export function createInitialBusinessState(
     customers: [],
     goals,
     auditLogs: [],
+    shiftClosings: [],
     idempotencyKeys: {},
   };
 }
@@ -684,9 +692,19 @@ export function calculateFinancialSnapshot(
     }
   }
 
-  // Pending Receivables & Payables
-  const pendingReceivablesCents = state.receivables
-    .filter((r) => r.status === 'pending' || r.status === 'overdue')
+  // Pending Receivables & Payables (Separated by kind: Pix Pending vs Card to Settle vs Other)
+  const activeReceivables = state.receivables.filter(
+    (r) => r.status === 'pending' || r.status === 'overdue'
+  );
+  const pendingReceivablesCents = activeReceivables.reduce(
+    (acc, r) => acc + r.remainingAmountCents,
+    0
+  );
+  const pendingPixCents = activeReceivables
+    .filter((r) => r.receivableKind === 'pix_pending')
+    .reduce((acc, r) => acc + r.remainingAmountCents, 0);
+  const pendingCardSettlementCents = activeReceivables
+    .filter((r) => r.receivableKind === 'card_settlement')
     .reduce((acc, r) => acc + r.remainingAmountCents, 0);
 
   const pendingPayablesCents = state.payables
@@ -834,6 +852,8 @@ export function calculateFinancialSnapshot(
     totalInventoryAssetCents,
     sellableInventoryAssetCents,
     pendingReceivablesCents,
+    pendingPixCents,
+    pendingCardSettlementCents,
     pendingPayablesCents,
     totalOwnerContributionsCents,
     totalOwnerWithdrawalsCents,
