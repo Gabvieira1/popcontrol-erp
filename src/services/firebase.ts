@@ -50,7 +50,7 @@ function getCloudSyncAuthToken(): string {
   try {
     const reversed = atob(ENCODED_SYNC_KEY);
     const full = reversed.split('').reverse().join('');
-    return full.split(':')[0];
+    return full.slice(0, 40);
   } catch {
     return '';
   }
@@ -338,7 +338,7 @@ export function subscribeToRealtimeBusinessUpdates(
     }
   };
 
-  const intervalId = window.setInterval(checkCloud, 3500);
+  const intervalId = window.setInterval(checkCloud, 1800);
   const handleVisibility = () => {
     if (document.visibilityState === 'visible') {
       checkCloud();
