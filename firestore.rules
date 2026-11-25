@@ -1,0 +1,231 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Deny all access by default (Section 19)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwnerUser(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function getMemberDoc(businessId) {
+      return get(/databases/$(database)/documents/businesses/$(businessId)/members/$(request.auth.uid));
+    }
+
+    function isBusinessMember(businessId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/businesses/$(businessId)/members/$(request.auth.uid)) &&
+        getMemberDoc(businessId).data.active == true;
+    }
+
+    function isBusinessAdmin(businessId) {
+      return isBusinessMember(businessId) &&
+        getMemberDoc(businessId).data.role == 'admin';
+    }
+
+    function isNonNegativeInt(val) {
+      return val is int && val >= 0;
+    }
+
+    function isPositiveInt(val) {
+      return val is int && val > 0;
+    }
+
+    // User profile document
+    match /users/{uid} {
+      allow read: if isOwnerUser(uid);
+      allow create: if isOwnerUser(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.role in ['admin', 'operator'];
+      // Prevent privilege escalation on role or uid
+      allow update: if isOwnerUser(uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.businessId == resource.data.businessId;
+      allow delete: if false;
+    }
+
+    // Business root document & subcollections
+    match /businesses/{businessId} {
+      allow read: if isBusinessMember(businessId) ||
+        (isAuthenticated() && resource.data.profile.uid == request.auth.uid);
+
+      allow create: if isAuthenticated()
+        && request.resource.data.profile.uid == request.auth.uid
+        && request.resource.data.profile.businessId == businessId;
+
+      allow update: if isBusinessAdmin(businessId) ||
+        (isAuthenticated() && resource.data.profile.uid == request.auth.uid);
+
+      allow delete: if false;
+
+      // Members subcollection: Only admin can manage members, no self-elevation
+      match /members/{memberUid} {
+        allow read: if isBusinessMember(businessId) || isOwnerUser(memberUid);
+        allow create: if (isOwnerUser(memberUid) && !exists(/databases/$(database)/documents/businesses/$(businessId)/members/$(memberUid)))
+          || isBusinessAdmin(businessId);
+        allow update: if isBusinessAdmin(businessId)
+          && request.resource.data.uid == resource.data.uid;
+        allow delete: if false;
+      }
+
+      // Products subcollection
+      match /products/{productId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && isNonNegativeInt(request.resource.data.acquisitionCostCents)
+          && isPositiveInt(request.resource.data.salePriceCents)
+          && isPositiveInt(request.resource.data.unitsPerBox);
+        allow delete: if false;
+      }
+
+      // Suppliers subcollection
+      match /suppliers/{supplierId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && request.resource.data.name is string;
+        allow delete: if false;
+      }
+
+      // Customers subcollection
+      match /customers/{customerId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isNonNegativeInt(request.resource.data.totalSpentCents);
+        allow delete: if false;
+      }
+
+      // Sales subcollection: Immutable deletion, integer cents validation
+      match /sales/{saleId} {
+        allow read: if isBusinessMember(businessId);
+        allow create: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isPositiveInt(request.resource.data.totalUnits)
+          && isNonNegativeInt(request.resource.data.totalCents)
+          && isNonNegativeInt(request.resource.data.totalCmvCents)
+          && request.resource.data.status == 'completed';
+        // Only allow status transition to refunded or cancelled by admin
+        allow update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && request.resource.data.totalCents == resource.data.totalCents
+          && request.resource.data.totalCmvCents == resource.data.totalCmvCents
+          && request.resource.data.status in ['cancelled', 'refunded'];
+        allow delete: if false;
+      }
+
+      // Purchases subcollection
+      match /purchases/{purchaseId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && isPositiveInt(request.resource.data.totalUnits)
+          && isNonNegativeInt(request.resource.data.totalCostCents);
+        allow delete: if false;
+      }
+
+      // Inventory Lots subcollection
+      match /inventoryLots/{lotId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isPositiveInt(request.resource.data.quantityReceived)
+          && isNonNegativeInt(request.resource.data.quantityRemaining)
+          && request.resource.data.quantityRemaining <= request.resource.data.quantityReceived
+          && isNonNegativeInt(request.resource.data.unitAcquisitionCostCents);
+        allow delete: if false;
+      }
+
+      // Stock Movements subcollection: Append-only audit log, never edited or deleted
+      match /stockMovements/{movementId} {
+        allow read: if isBusinessMember(businessId);
+        allow create: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isPositiveInt(request.resource.data.quantity)
+          && isNonNegativeInt(request.resource.data.unitCostCents);
+        allow update, delete: if false;
+      }
+
+      // Financial Transactions subcollection: Append-only, no deletion or manipulation
+      match /financialTransactions/{transactionId} {
+        allow read: if isBusinessAdmin(businessId);
+        allow create: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isPositiveInt(request.resource.data.amountCents)
+          && request.resource.data.direction in ['in', 'out', 'transfer'];
+        allow update, delete: if false;
+      }
+
+      // Accounts subcollection: Prevent direct arbitrary balance manipulation
+      match /accounts/{accountId} {
+        allow read: if isBusinessMember(businessId);
+        allow create: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && isNonNegativeInt(request.resource.data.initialBalanceCents);
+        allow update: if isBusinessAdmin(businessId)
+          && request.resource.data.initialBalanceCents == resource.data.initialBalanceCents;
+        allow delete: if false;
+      }
+
+      // Payables & Receivables
+      match /payables/{payableId} {
+        allow read: if isBusinessAdmin(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId
+          && isNonNegativeInt(request.resource.data.totalAmountCents)
+          && isNonNegativeInt(request.resource.data.remainingAmountCents);
+        allow delete: if false;
+      }
+
+      match /receivables/{receivableId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && isNonNegativeInt(request.resource.data.totalAmountCents)
+          && isNonNegativeInt(request.resource.data.remainingAmountCents);
+        allow delete: if false;
+      }
+
+      // Goals & Settings
+      match /goals/{goalId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId;
+        allow delete: if isBusinessAdmin(businessId);
+      }
+
+      match /settings/{settingId} {
+        allow read: if isBusinessMember(businessId);
+        allow create, update: if isBusinessAdmin(businessId)
+          && request.resource.data.businessId == businessId;
+        allow delete: if false;
+      }
+
+      // Audit Logs & Idempotency Keys: Strictly append-only
+      match /auditLogs/{logId} {
+        allow read: if isBusinessAdmin(businessId);
+        allow create: if isBusinessMember(businessId)
+          && request.resource.data.businessId == businessId
+          && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if false;
+      }
+
+      match /idempotencyKeys/{keyId} {
+        allow read: if isBusinessMember(businessId);
+        allow create: if isBusinessMember(businessId);
+        allow update, delete: if false;
+      }
+    }
+  }
+}
