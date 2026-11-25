@@ -12,6 +12,7 @@ import {
   getSavedSession,
   loadBusinessDatabase,
   executeAtomicBusinessMutation,
+  subscribeToRealtimeBusinessUpdates,
   logoutSession,
   initFirebaseIfConfigured,
 } from '../services/firebase';
@@ -203,7 +204,7 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [notify]);
 
-  // Synchronize across tabs/devices
+  // Synchronize across tabs and across devices (Mobile <-> Desktop) in real time
   useEffect(() => {
     const handleStorage = (e: StorageEvent) => {
       if (session && e.key === `popcontrol_business_db_v1_${session.businessId}` && e.newValue) {
@@ -215,7 +216,21 @@ export const ERPProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     };
     window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
+
+    let unsubscribeCloud: (() => void) | undefined;
+    if (session) {
+      unsubscribeCloud = subscribeToRealtimeBusinessUpdates(
+        session.businessId,
+        (remoteState) => {
+          setDb(remoteState);
+        }
+      );
+    }
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      if (unsubscribeCloud) unsubscribeCloud();
+    };
   }, [session]);
 
   useEffect(() => {

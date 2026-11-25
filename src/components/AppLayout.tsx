@@ -192,7 +192,9 @@ export const AppLayout: React.FC<{
               <div className="flex items-center gap-2 text-[11px] text-[#71717A] dark:text-zinc-400">
                 <span>{session?.isDemoMode ? 'Modo Demonstração (Isolado)' : 'Produção'}</span>
                 <span>•</span>
-                <span>{isFirebaseConnected ? 'Firebase Cloud' : 'Banco Sincronizado'}</span>
+                <span className="text-[#16A34A] font-medium">
+                  {isFirebaseConnected ? 'Firebase Cloud Sync' : 'Nuvem Multi-Dispositivo Ativa'}
+                </span>
               </div>
             </div>
           </div>
