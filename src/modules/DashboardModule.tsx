@@ -350,30 +350,6 @@ export const DashboardModule: React.FC<{ onOpenOnboarding: () => void }> = ({
         </div>
       )}
 
-      {/* Onboarding Banner if initial capital/purchase not confirmed yet */}
-      {!db.settings.initialCapitalConfirmed && (
-        <div className="p-4 rounded-xl bg-[#F6C344]/20 border border-[#F6C344] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-start gap-3">
-            <Sparkles className="w-5 h-5 text-[#A16207] dark:text-[#F6C344] shrink-0 mt-0.5" />
-            <div className="text-xs">
-              <h4 className="font-bold text-sm text-[#18181B] dark:text-white">
-                Pronto para iniciar a operação Dr. Pipoca com R$ 130,00?
-              </h4>
-              <p className="text-[#71717A] dark:text-zinc-300">
-                O sistema não cria compras fictícias sem sua autorização. Confirme no Onboarding o aporte de R$ 130,00 e a compra da 1ª caixa (20 un por R$ 117,80).
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onOpenOnboarding}
-            className="px-4 py-2 rounded-lg bg-[#18181B] text-white text-xs font-bold shrink-0"
-          >
-            Confirmar Aporte & 1ª Caixa
-          </button>
-        </div>
-      )}
-
       {/* GROUP A: CURRENT POSITION INDICATORS (Posição Atual: Caixa, Estoque e Patrimônio) */}
       <div>
         <div className="flex items-center justify-between mb-2.5">

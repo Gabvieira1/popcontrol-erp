@@ -321,7 +321,7 @@ export function createInitialBusinessState(
       lowMarginThresholdPercent: 30,
       payableDueWarningDays: 5,
     },
-    onboardingCompleted: false,
+    onboardingCompleted: true,
     initialCapitalConfirmed: false,
     initialPurchaseConfirmed: false,
     updatedAt: now,

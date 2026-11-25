@@ -20,12 +20,6 @@ const MainRouter: React.FC = () => {
   const { session, setSession, db, isLoading, activeModule } = useERP();
   const [showOnboarding, setShowOnboarding] = useState(false);
 
-  useEffect(() => {
-    if (db && !db.settings.onboardingCompleted) {
-      setShowOnboarding(true);
-    }
-  }, [db]);
-
   if (!session) {
     return <AuthScreen onAuthenticated={(s) => setSession(s)} />;
   }

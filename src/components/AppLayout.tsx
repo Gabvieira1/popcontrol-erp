@@ -200,17 +200,6 @@ export const AppLayout: React.FC<{
           </div>
 
           <div className="flex items-center gap-2">
-            {(!db?.settings.initialCapitalConfirmed || !db?.settings.initialPurchaseConfirmed) && (
-              <button
-                type="button"
-                onClick={onOpenOnboarding}
-                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#F6C344]/20 border border-[#F6C344] text-[#A16207] dark:text-[#F6C344] text-xs font-semibold hover:bg-[#F6C344]/30"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                Assistente Inicial (R$ 130,00)
-              </button>
-            )}
-
             <button
               type="button"
               onClick={() => setScannerOpen(true)}
